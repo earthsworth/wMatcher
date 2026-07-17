@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -22,14 +23,19 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import javax.swing.SwingUtilities;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
+import org.earthsworth.wmatcher.core.model.ClassClassification;
+import org.earthsworth.wmatcher.core.model.ClassPair;
 import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.DecompileRequest;
+import org.earthsworth.wmatcher.core.model.DetachedPair;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.DiffResult;
+import org.earthsworth.wmatcher.core.model.DiffUpdate;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchResult;
+import org.earthsworth.wmatcher.core.model.MatchingUpdate;
 import org.earthsworth.wmatcher.core.model.MatchingPolicy;
 import org.earthsworth.wmatcher.core.model.ResourceContent;
 import org.earthsworth.wmatcher.core.model.ScanOptions;
@@ -40,8 +46,10 @@ import org.earthsworth.wmatcher.core.service.ArtifactInspector;
 import org.earthsworth.wmatcher.core.service.ArtifactLoader;
 import org.earthsworth.wmatcher.core.service.DecompilerService;
 import org.earthsworth.wmatcher.core.service.DiffEngine;
+import org.earthsworth.wmatcher.core.service.DiffSession;
 import org.earthsworth.wmatcher.core.service.MappingService;
 import org.earthsworth.wmatcher.core.service.MatchingEngine;
+import org.earthsworth.wmatcher.core.service.MatchingSession;
 import org.earthsworth.wmatcher.core.service.ProjectRepository;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
 import org.earthsworth.wmatcher.engine.decompile.VineflowerDecompilerService;
@@ -51,8 +59,11 @@ import org.earthsworth.wmatcher.engine.jar.ZipArtifactInspector;
 import org.earthsworth.wmatcher.engine.mapping.MappingIoService;
 import org.earthsworth.wmatcher.engine.match.DefaultMatchingEngine;
 import org.earthsworth.wmatcher.engine.project.JacksonProjectRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class WorkspaceController implements AutoCloseable {
+    private static final Logger LOGGER = LoggerFactory.getLogger(WorkspaceController.class);
     private final ArtifactLoader loader;
     private final MatchingEngine matcher;
     private final DiffEngine differ;
@@ -65,9 +76,13 @@ public final class WorkspaceController implements AutoCloseable {
     private final Deque<ComparisonOverrides> redo = new ArrayDeque<>();
     private final List<Consumer<Boolean>> documentStateListeners = new CopyOnWriteArrayList<>();
     private final AtomicLong documentRevision = new AtomicLong();
+    private final AtomicLong analysisGeneration = new AtomicLong();
     private volatile AtomicBoolean cancellation = new AtomicBoolean();
     private volatile Future<?> activeJob;
     private volatile Workspace workspace;
+    private volatile MatchingSession matchingSession;
+    private volatile DiffSession diffSession;
+    private volatile AnalysisUpdate latestAnalysisUpdate;
     private volatile long savedRevision;
 
     public WorkspaceController() {
@@ -95,6 +110,10 @@ public final class WorkspaceController implements AutoCloseable {
 
     public Workspace workspace() {
         return workspace;
+    }
+
+    public AnalysisUpdate latestAnalysisUpdate() {
+        return latestAnalysisUpdate;
     }
 
     public boolean hasUnsavedChanges() {
@@ -128,16 +147,25 @@ public final class WorkspaceController implements AutoCloseable {
                 token.throwIfCancelled();
                 FilteredOverrides filtered = validOverrides(request.initialOverrides(), left, right);
                 progress(progress, new ProgressUpdate("Matching entities", 0, 1));
-                MatchResult matchResult = matcher.match(left, right, filtered.overrides(),
-                        MatchingPolicy.conservativeV1(),
+                closeAnalysisSessions();
+                MatchingSession newMatchingSession = matcher.openSession(
+                        left, right, MatchingPolicy.conservativeV1(),
+                        (stage, completed, total) -> progress(progress,
+                                new ProgressUpdate(stage, completed, total)), token);
+                DiffSession newDiffSession = differ.openSession(left, right);
+                matchingSession = newMatchingSession;
+                diffSession = newDiffSession;
+                MatchResult matchResult = newMatchingSession.match(filtered.overrides(),
                         (stage, completed, total) -> progress(progress, new ProgressUpdate(stage, completed, total)), token);
-                DiffResult diffResult = differ.diff(left, right, matchResult, filtered.overrides(),
+                FilteredOverrides validated = validClassifications(filtered, matchResult);
+                DiffResult diffResult = newDiffSession.diff(matchResult, validated.overrides(),
                         (stage, completed, total) -> progress(progress, new ProgressUpdate(stage, completed, total)), token);
-                String warning = warning(request, left, right, filtered.dropped());
-                Workspace result = new Workspace(left, right, matchResult, diffResult, filtered.overrides(),
+                String warning = warning(request, left, right, validated.dropped());
+                Workspace result = new Workspace(left, right, matchResult, diffResult, validated.overrides(),
                         request.leftLibraries(), request.rightLibraries(), request.projectPath(), warning,
                         request.uiState());
                 workspace = result;
+                latestAnalysisUpdate = new AnalysisUpdate(result, Set.of(), true, PhaseTimings.ZERO);
                 undo.clear();
                 redo.clear();
                 resetDocumentState(request.projectPath() != null);
@@ -169,7 +197,7 @@ public final class WorkspaceController implements AutoCloseable {
                         List.of(),
                         List.of(),
                         new ComparisonOverrides(project.lockedMappings(), project.confirmedRemoved(),
-                                project.confirmedAdded()),
+                                project.confirmedAdded(), project.detachedPairs(), project.classifications()),
                         projectPath,
                         project.left().sha256(),
                         project.right().sha256(),
@@ -195,6 +223,8 @@ public final class WorkspaceController implements AutoCloseable {
                         current.lockedMappings(),
                         current.confirmedRemoved(),
                         current.confirmedAdded(),
+                        current.overrides().detachedPairs(),
+                        current.overrides().classifications(),
                         uiState);
                 projects.save(path, project);
                 Workspace latest = workspace;
@@ -215,10 +245,18 @@ public final class WorkspaceController implements AutoCloseable {
         Map<EntityId, EntityId> updated = new LinkedHashMap<>(current.lockedMappings());
         Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
         Set<EntityId> added = new HashSet<>(current.confirmedAdded());
+        Set<DetachedPair> detached = new HashSet<>(current.overrides().detachedPairs());
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
         updated.entrySet().removeIf(entry -> entry.getKey().equals(decision.left())
                 || entry.getValue().equals(decision.right()));
         removed.remove(decision.left());
         added.remove(decision.right());
+        detached.removeIf(pair -> pair.involves(decision.left()) || pair.involves(decision.right()));
+        ClassPair selectedPair = decision.left().kind() == EntityKind.CLASS
+                ? new ClassPair(decision.left(), decision.right()) : null;
+        classifications.keySet().removeIf(pair -> (pair.involves(decision.left())
+                || pair.involves(decision.right())) && !pair.equals(selectedPair));
         updated.put(decision.left(), decision.right());
         if (decision.left().kind() == EntityKind.CLASS) {
             Map<EntityId, EntityId> projectedClasses = new LinkedHashMap<>();
@@ -231,7 +269,13 @@ public final class WorkspaceController implements AutoCloseable {
             updated.entrySet().removeIf(entry -> isMember(entry.getKey())
                     && !ownersMatch(entry.getKey(), entry.getValue(), projectedClasses));
         }
-        pushAndRecompute(current.overrides(), new ComparisonOverrides(updated, removed, added), success, failure);
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                updated, removed, added, detached, classifications),
+                success, failure);
+    }
+
+    public void confirmMapping(MatchDecision decision, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        lockMapping(decision, success, failure);
     }
 
     public void unlockMapping(EntityId left, Consumer<Workspace> success, Consumer<Throwable> failure) {
@@ -241,13 +285,23 @@ public final class WorkspaceController implements AutoCloseable {
         }
         Map<EntityId, EntityId> updated = new LinkedHashMap<>(current.lockedMappings());
         EntityId previousRight = updated.remove(left);
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
+        classifications.keySet().removeIf(pair -> pair.involves(left)
+                || previousRight != null && pair.involves(previousRight));
         if (left.kind() == EntityKind.CLASS && previousRight != null) {
             updated.entrySet().removeIf(entry -> isMember(entry.getKey())
                     && (entry.getKey().owner().equals(left.name())
                     || entry.getValue().owner().equals(previousRight.name())));
         }
         pushAndRecompute(current.overrides(), new ComparisonOverrides(
-                updated, current.confirmedRemoved(), current.confirmedAdded()), success, failure);
+                updated, current.confirmedRemoved(), current.confirmedAdded(), current.overrides().detachedPairs(),
+                classifications),
+                success, failure);
+    }
+
+    public void restoreAutomatic(EntityId left, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        unlockMapping(left, success, failure);
     }
 
     public void confirmSingleSided(
@@ -258,13 +312,41 @@ public final class WorkspaceController implements AutoCloseable {
         }
         Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
         Set<EntityId> added = new HashSet<>(current.confirmedAdded());
+        Set<DetachedPair> detached = new HashSet<>(current.overrides().detachedPairs());
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
         if (node.left() != null) {
             removed.add(node.left());
+            detached.removeIf(pair -> pair.involves(node.left()));
+            classifications.keySet().removeIf(pair -> pair.involves(node.left()));
         } else {
             added.add(node.right());
+            detached.removeIf(pair -> pair.involves(node.right()));
+            classifications.keySet().removeIf(pair -> pair.involves(node.right()));
         }
         pushAndRecompute(current.overrides(), new ComparisonOverrides(
-                current.lockedMappings(), removed, added), success, failure);
+                current.lockedMappings(), removed, added, detached, classifications), success, failure);
+    }
+
+    public void confirmSingleSided(
+            Collection<DiffNode> nodes, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
+        Set<EntityId> added = new HashSet<>(current.confirmedAdded());
+        Set<DetachedPair> detached = new HashSet<>(current.overrides().detachedPairs());
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
+        for (DiffNode node : nodes) {
+            if ((node.left() == null) == (node.right() == null) || isMember(node.left() != null ? node.left() : node.right())) {
+                continue;
+            }
+            EntityId id = node.left() != null ? node.left() : node.right();
+            if (node.left() != null) removed.add(id); else added.add(id);
+            detached.removeIf(pair -> pair.involves(id));
+            classifications.keySet().removeIf(pair -> pair.involves(id));
+        }
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                current.lockedMappings(), removed, added, detached, classifications), success, failure);
     }
 
     public void clearSingleSidedResolution(
@@ -278,7 +360,65 @@ public final class WorkspaceController implements AutoCloseable {
             return;
         }
         pushAndRecompute(current.overrides(), new ComparisonOverrides(
-                current.lockedMappings(), removed, added), success, failure);
+                current.lockedMappings(), removed, added, current.overrides().detachedPairs(),
+                current.overrides().classifications()), success, failure);
+    }
+
+    public void detachMapping(DiffNode node, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        if (node.left() == null || node.right() == null || isMember(node.left())) {
+            return;
+        }
+        Workspace current = requireWorkspace();
+        Map<EntityId, EntityId> mappings = new LinkedHashMap<>(current.lockedMappings());
+        mappings.entrySet().removeIf(entry -> entry.getKey().equals(node.left())
+                || entry.getValue().equals(node.right())
+                || node.left().kind() == EntityKind.CLASS && isMember(entry.getKey())
+                && (entry.getKey().owner().equals(node.left().name())
+                || entry.getValue().owner().equals(node.right().name())));
+        Set<DetachedPair> detached = new HashSet<>(current.overrides().detachedPairs());
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
+        detached.removeIf(pair -> pair.involves(node.left()) || pair.involves(node.right()));
+        detached.add(new DetachedPair(node.left(), node.right()));
+        classifications.keySet().removeIf(pair -> pair.involves(node.left()) || pair.involves(node.right()));
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                mappings, current.confirmedRemoved(), current.confirmedAdded(), detached, classifications),
+                success, failure);
+    }
+
+    public void restoreDetached(EntityId entity, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        Set<DetachedPair> detached = new HashSet<>(current.overrides().detachedPairs());
+        if (!detached.removeIf(pair -> pair.involves(entity))) {
+            return;
+        }
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                current.lockedMappings(), current.confirmedRemoved(), current.confirmedAdded(), detached,
+                current.overrides().classifications()),
+                success, failure);
+    }
+
+    public void classifyClass(
+            DiffNode node,
+            ClassClassification classification,
+            Consumer<Workspace> success,
+            Consumer<Throwable> failure) {
+        if (node.kind() != EntityKind.CLASS || node.left() == null || node.right() == null) {
+            return;
+        }
+        Workspace current = requireWorkspace();
+        ClassPair pair = new ClassPair(node.left(), node.right());
+        Map<ClassPair, ClassClassification> classifications = new LinkedHashMap<>(
+                current.overrides().classifications());
+        if (classification == ClassClassification.AUTO) {
+            classifications.remove(pair);
+        } else {
+            classifications.put(pair, classification);
+        }
+        ComparisonOverrides updated = new ComparisonOverrides(
+                current.lockedMappings(), current.confirmedRemoved(), current.confirmedAdded(),
+                current.detachedPairs(), classifications);
+        pushAndRecompute(current.overrides(), updated, success, failure);
     }
 
     public void undoMappings(Consumer<Workspace> success, Consumer<Throwable> failure) {
@@ -288,7 +428,7 @@ public final class WorkspaceController implements AutoCloseable {
         Workspace current = requireWorkspace();
         ComparisonOverrides target = undo.pop();
         redo.push(current.overrides());
-        recompute(target, success, failure);
+        recompute(current.overrides(), target, success, failure);
     }
 
     public void redoMappings(Consumer<Workspace> success, Consumer<Throwable> failure) {
@@ -298,7 +438,7 @@ public final class WorkspaceController implements AutoCloseable {
         Workspace current = requireWorkspace();
         ComparisonOverrides target = redo.pop();
         undo.push(current.overrides());
-        recompute(target, success, failure);
+        recompute(current.overrides(), target, success, failure);
     }
 
     public boolean canUndo() {
@@ -393,7 +533,25 @@ public final class WorkspaceController implements AutoCloseable {
     @Override
     public void close() {
         cancel();
+        closeAnalysisSessions();
         executor.shutdownNow();
+    }
+
+    private void closeAnalysisSessions() {
+        MatchingSession oldMatching = matchingSession;
+        DiffSession oldDiff = diffSession;
+        matchingSession = null;
+        diffSession = null;
+        if (oldMatching != null) {
+            try { oldMatching.close(); } catch (RuntimeException exception) {
+                LOGGER.debug("Could not close matching session", exception);
+            }
+        }
+        if (oldDiff != null) {
+            try { oldDiff.close(); } catch (RuntimeException exception) {
+                LOGGER.debug("Could not close diff session", exception);
+            }
+        }
     }
 
     private void pushAndRecompute(
@@ -407,31 +565,91 @@ public final class WorkspaceController implements AutoCloseable {
         }
         undo.push(previous);
         redo.clear();
-        recompute(updated, success, failure);
+        recompute(previous, updated, success, failure);
     }
 
     private void recompute(
+            ComparisonOverrides previousOverrides,
             ComparisonOverrides overrides,
             Consumer<Workspace> success,
             Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
+        if (matchingStateEquals(previousOverrides, overrides)) {
+            Workspace updated = current.withAnalysis(current.matches(), current.differences(), overrides);
+            workspace = updated;
+            Set<EntityId> affected = classificationEntities(previousOverrides, overrides);
+            latestAnalysisUpdate = new AnalysisUpdate(updated, affected, false, PhaseTimings.ZERO);
+            documentRevision.incrementAndGet();
+            onEdt(() -> {
+                notifyDocumentStateListeners();
+                success.accept(updated);
+            });
+            return;
+        }
+        long generation = analysisGeneration.incrementAndGet();
         executor.submit(() -> {
             try {
-                MatchResult matchResult = matcher.match(current.left(), current.right(), overrides,
-                        MatchingPolicy.conservativeV1(), (stage, completed, total) -> { }, CancellationToken.NONE);
-                DiffResult diffResult = differ.diff(current.left(), current.right(), matchResult, overrides,
-                        (stage, completed, total) -> { }, CancellationToken.NONE);
-                Workspace updated = current.withAnalysis(matchResult, diffResult, overrides);
+                long started = System.nanoTime();
+                Set<EntityId> affected = affectedEntities(previousOverrides, overrides);
+                long overridesResolved = System.nanoTime();
+                int totalEntities = current.left().entryCount() + current.right().entryCount();
+                boolean incremental = affected.size() <= 1_000
+                        && affected.size() <= Math.max(2, totalEntities / 10);
+                MatchingSession currentMatchingSession = matchingSession;
+                DiffSession currentDiffSession = diffSession;
+                MatchingUpdate matchingUpdate = incremental && currentMatchingSession != null
+                        ? currentMatchingSession.rematchUpdate(current.matches(), previousOverrides, overrides,
+                                affected, (stage, completed, total) -> { }, CancellationToken.NONE)
+                        : new MatchingUpdate(incremental
+                                ? matcher.rematch(current.left(), current.right(), current.matches(),
+                                        previousOverrides, overrides, affected, MatchingPolicy.conservativeV1(),
+                                        (stage, completed, total) -> { }, CancellationToken.NONE)
+                                : matcher.match(current.left(), current.right(), overrides,
+                                        MatchingPolicy.conservativeV1(), (stage, completed, total) -> { },
+                                        CancellationToken.NONE), affected, !incremental);
+                MatchResult matchResult = matchingUpdate.result();
+                ComparisonOverrides effectiveOverrides = retainMatchingClassifications(overrides, matchResult);
+                long matched = System.nanoTime();
+                Set<EntityId> diffAffected = new HashSet<>(matchingUpdate.affectedEntities());
+                addChangedMatchEntities(current.matches(), matchResult, diffAffected);
+                DiffUpdate diffUpdate = incremental && currentDiffSession != null
+                        ? currentDiffSession.rediffUpdate(matchResult, current.differences(), effectiveOverrides,
+                                diffAffected, (stage, completed, total) -> { }, CancellationToken.NONE)
+                        : new DiffUpdate(incremental
+                                ? differ.rediff(current.left(), current.right(), matchResult,
+                                        current.differences(), effectiveOverrides, diffAffected,
+                                        (stage, completed, total) -> { }, CancellationToken.NONE)
+                                : differ.diff(current.left(), current.right(), matchResult, effectiveOverrides,
+                                        (stage, completed, total) -> { }, CancellationToken.NONE),
+                                diffAffected, !incremental);
+                DiffResult diffResult = diffUpdate.result();
+                long diffed = System.nanoTime();
+                Workspace updated = current.withAnalysis(matchResult, diffResult, effectiveOverrides);
+                if (analysisGeneration.get() != generation) {
+                    return;
+                }
                 workspace = updated;
+                PhaseTimings timings = new PhaseTimings(
+                        elapsedMillis(started, overridesResolved), elapsedMillis(overridesResolved, matched),
+                        elapsedMillis(matched, diffed));
+                latestAnalysisUpdate = new AnalysisUpdate(updated, diffUpdate.affectedEntities(),
+                        matchingUpdate.fullRefresh() || diffUpdate.fullRefresh(), timings);
                 documentRevision.incrementAndGet();
                 onEdt(() -> {
                     notifyDocumentStateListeners();
                     success.accept(updated);
                 });
+                LOGGER.info("Incremental analysis: overrides={}ms, matching={}ms, diff={}ms, total={}ms, affected={}",
+                        elapsedMillis(started, overridesResolved), elapsedMillis(overridesResolved, matched),
+                        elapsedMillis(matched, diffed), elapsedMillis(started, diffed), affected.size());
             } catch (Throwable throwable) {
                 onEdt(() -> failure.accept(unwrap(throwable)));
             }
         });
+    }
+
+    private static long elapsedMillis(long start, long end) {
+        return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(end - start);
     }
 
     private void importMappings(
@@ -444,7 +662,8 @@ public final class WorkspaceController implements AutoCloseable {
                 Map<EntityId, EntityId> imported = importer.get();
                 Map<EntityId, EntityId> merged = mergeWithoutOverwriting(current.overrides(), imported);
                 ComparisonOverrides updated = new ComparisonOverrides(
-                        merged, current.confirmedRemoved(), current.confirmedAdded());
+                        merged, current.confirmedRemoved(), current.confirmedAdded(),
+                        current.overrides().detachedPairs(), current.overrides().classifications());
                 onEdt(() -> pushAndRecompute(current.overrides(), updated, success, failure));
             } catch (Throwable throwable) {
                 onEdt(() -> failure.accept(unwrap(throwable)));
@@ -459,11 +678,103 @@ public final class WorkspaceController implements AutoCloseable {
         imported.forEach((left, right) -> {
             if (!existing.confirmedRemoved().contains(left)
                     && !existing.confirmedAdded().contains(right)
+                    && existing.detachedPairs().stream().noneMatch(pair -> pair.involves(left) || pair.involves(right))
                     && !merged.containsKey(left) && usedRight.add(right)) {
                 merged.put(left, right);
             }
         });
         return merged;
+    }
+
+    private static Set<EntityId> affectedEntities(
+            ComparisonOverrides previous, ComparisonOverrides updated) {
+        Set<EntityId> affected = new HashSet<>();
+        previous.lockedMappings().forEach((left, right) -> {
+            if (!right.equals(updated.lockedMappings().get(left))) {
+                affected.add(left);
+                affected.add(right);
+            }
+        });
+        updated.lockedMappings().forEach((left, right) -> {
+            if (!right.equals(previous.lockedMappings().get(left))) {
+                affected.add(left);
+                affected.add(right);
+            }
+        });
+        symmetricDifference(previous.confirmedRemoved(), updated.confirmedRemoved(), affected);
+        symmetricDifference(previous.confirmedAdded(), updated.confirmedAdded(), affected);
+        Set<DetachedPair> detached = new HashSet<>(previous.detachedPairs());
+        detached.addAll(updated.detachedPairs());
+        for (DetachedPair pair : detached) {
+            if (previous.detachedPairs().contains(pair) != updated.detachedPairs().contains(pair)) {
+                affected.add(pair.left());
+                affected.add(pair.right());
+            }
+        }
+        return Set.copyOf(affected);
+    }
+
+    private static boolean matchingStateEquals(ComparisonOverrides first, ComparisonOverrides second) {
+        return first.lockedMappings().equals(second.lockedMappings())
+                && first.confirmedRemoved().equals(second.confirmedRemoved())
+                && first.confirmedAdded().equals(second.confirmedAdded())
+                && first.detachedPairs().equals(second.detachedPairs());
+    }
+
+    private static Set<EntityId> classificationEntities(
+            ComparisonOverrides previous, ComparisonOverrides updated) {
+        Set<EntityId> affected = new HashSet<>();
+        Set<ClassPair> pairs = new HashSet<>(previous.classifications().keySet());
+        pairs.addAll(updated.classifications().keySet());
+        for (ClassPair pair : pairs) {
+            if (previous.classifications().get(pair) != updated.classifications().get(pair)) {
+                affected.add(pair.left());
+                affected.add(pair.right());
+            }
+        }
+        return Set.copyOf(affected);
+    }
+
+    private static ComparisonOverrides retainMatchingClassifications(
+            ComparisonOverrides overrides, MatchResult matches) {
+        Set<ClassPair> pairs = matches.confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .map(match -> new ClassPair(match.left(), match.right()))
+                .collect(java.util.stream.Collectors.toSet());
+        Map<ClassPair, ClassClassification> classifications = overrides.classifications().entrySet().stream()
+                .filter(entry -> pairs.contains(entry.getKey()))
+                .collect(java.util.stream.Collectors.toMap(
+                        Map.Entry::getKey, Map.Entry::getValue, (first, ignored) -> first, LinkedHashMap::new));
+        if (classifications.size() == overrides.classifications().size()) return overrides;
+        return new ComparisonOverrides(overrides.lockedMappings(), overrides.confirmedRemoved(),
+                overrides.confirmedAdded(), overrides.detachedPairs(), classifications);
+    }
+
+    private static void addChangedMatchEntities(
+            MatchResult previous, MatchResult updated, Set<EntityId> affected) {
+        Map<EntityId, EntityId> before = previous.confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .collect(java.util.stream.Collectors.toMap(MatchDecision::left, MatchDecision::right));
+        Map<EntityId, EntityId> after = updated.confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .collect(java.util.stream.Collectors.toMap(MatchDecision::left, MatchDecision::right));
+        before.forEach((left, right) -> {
+            if (!right.equals(after.get(left))) {
+                affected.add(left);
+                affected.add(right);
+            }
+        });
+        after.forEach((left, right) -> {
+            if (!right.equals(before.get(left))) {
+                affected.add(left);
+                affected.add(right);
+            }
+        });
+    }
+
+    private static void symmetricDifference(Set<EntityId> first, Set<EntityId> second, Set<EntityId> target) {
+        first.stream().filter(id -> !second.contains(id)).forEach(target::add);
+        second.stream().filter(id -> !first.contains(id)).forEach(target::add);
     }
 
     private static boolean isMember(EntityId id) {
@@ -511,10 +822,20 @@ public final class WorkspaceController implements AutoCloseable {
         Set<EntityId> added = requested.confirmedAdded().stream()
                 .filter(id -> entityExists(right, id))
                 .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+        Set<DetachedPair> detached = requested.detachedPairs().stream()
+                .filter(pair -> entityExists(left, pair.left()) && entityExists(right, pair.right()))
+                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+        Map<ClassPair, ClassClassification> classifications = requested.classifications().entrySet().stream()
+                .filter(entry -> entityExists(left, entry.getKey().left())
+                        && entityExists(right, entry.getKey().right()))
+                .collect(java.util.stream.Collectors.toMap(
+                        Map.Entry::getKey, Map.Entry::getValue, (first, ignored) -> first, LinkedHashMap::new));
         Map<EntityId, EntityId> result = new LinkedHashMap<>();
         Set<EntityId> rightUsed = new HashSet<>();
         int dropped = requested.confirmedRemoved().size() - removed.size()
-                + requested.confirmedAdded().size() - added.size();
+                + requested.confirmedAdded().size() - added.size()
+                + requested.detachedPairs().size() - detached.size()
+                + requested.classifications().size() - classifications.size();
         for (Map.Entry<EntityId, EntityId> entry : requested.lockedMappings().entrySet()) {
             if (entityExists(left, entry.getKey()) && entityExists(right, entry.getValue())
                     && !removed.contains(entry.getKey()) && !added.contains(entry.getValue())
@@ -524,7 +845,16 @@ public final class WorkspaceController implements AutoCloseable {
                 dropped++;
             }
         }
-        return new FilteredOverrides(new ComparisonOverrides(result, removed, added), dropped);
+        int detachedBeforeConflicts = detached.size();
+        detached.removeIf(pair -> result.containsKey(pair.left()) || result.containsValue(pair.right())
+                || removed.contains(pair.left()) || added.contains(pair.right()));
+        dropped += detachedBeforeConflicts - detached.size();
+        int classificationsBeforeConflicts = classifications.size();
+        classifications.keySet().removeIf(pair -> detached.stream().anyMatch(detachedPair ->
+                detachedPair.left().equals(pair.left()) || detachedPair.right().equals(pair.right())));
+        dropped += classificationsBeforeConflicts - classifications.size();
+        return new FilteredOverrides(new ComparisonOverrides(
+                result, removed, added, detached, classifications), dropped);
     }
 
     private static boolean entityExists(ArtifactSnapshot artifact, EntityId id) {
@@ -543,6 +873,23 @@ public final class WorkspaceController implements AutoCloseable {
                     && method.descriptor().equals(id.descriptor()));
             case RESOURCE -> false;
         };
+    }
+
+    private static FilteredOverrides validClassifications(FilteredOverrides filtered, MatchResult matches) {
+        Set<ClassPair> pairedClasses = matches.confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .map(match -> new ClassPair(match.left(), match.right()))
+                .collect(java.util.stream.Collectors.toSet());
+        Map<ClassPair, ClassClassification> valid = filtered.overrides().classifications().entrySet().stream()
+                .filter(entry -> pairedClasses.contains(entry.getKey()))
+                .collect(java.util.stream.Collectors.toMap(
+                        Map.Entry::getKey, Map.Entry::getValue, (first, ignored) -> first, LinkedHashMap::new));
+        int dropped = filtered.dropped()
+                + filtered.overrides().classifications().size() - valid.size();
+        ComparisonOverrides overrides = filtered.overrides();
+        return new FilteredOverrides(new ComparisonOverrides(
+                overrides.lockedMappings(), overrides.confirmedRemoved(), overrides.confirmedAdded(),
+                overrides.detachedPairs(), valid), dropped);
     }
 
     private static String warning(CompareRequest request, ArtifactSnapshot left, ArtifactSnapshot right, int dropped) {
@@ -668,6 +1015,20 @@ public final class WorkspaceController implements AutoCloseable {
 
     public record ProgressUpdate(String stage, long completed, long total) { }
 
+    public record PhaseTimings(long overridesMillis, long matchingMillis, long diffMillis) {
+        public static final PhaseTimings ZERO = new PhaseTimings(0, 0, 0);
+    }
+
+    public record AnalysisUpdate(
+            Workspace workspace,
+            Set<EntityId> affectedEntities,
+            boolean fullRefresh,
+            PhaseTimings timings) {
+        public AnalysisUpdate {
+            affectedEntities = Set.copyOf(affectedEntities);
+        }
+    }
+
     public record Workspace(
             ArtifactSnapshot left,
             ArtifactSnapshot right,
@@ -712,6 +1073,10 @@ public final class WorkspaceController implements AutoCloseable {
 
         public Set<EntityId> confirmedAdded() {
             return overrides.confirmedAdded();
+        }
+
+        public Set<DetachedPair> detachedPairs() {
+            return overrides.detachedPairs();
         }
 
         Workspace withAnalysis(

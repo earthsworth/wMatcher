@@ -15,6 +15,8 @@ import java.util.jar.JarOutputStream;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
+import org.earthsworth.wmatcher.core.model.ClassClassification;
+import org.earthsworth.wmatcher.core.model.ClassPair;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
@@ -150,6 +152,37 @@ class WorkspaceControllerTest {
     }
 
     @Test
+    void cancelingAClassMatchSplitsItIntoOldAndNewUnmatchedEntitiesAndUndoRestoresIt() throws Exception {
+        Path left = jar("detach-old.jar", "same/Owner", "read");
+        Path right = jar("detach-new.jar", "same/Owner", "read");
+        WorkspaceController controller = new WorkspaceController();
+        WorkspaceController.Workspace compared = compare(controller, left, right);
+        DiffNode paired = compared.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.CLASS && node.left() != null && node.right() != null)
+                .findFirst().orElseThrow();
+
+        WorkspaceController.Workspace detached = awaitMapping(
+                (success, failure) -> controller.detachMapping(paired, success, failure));
+
+        assertThat(detached.detachedPairs()).anyMatch(pair -> pair.left().equals(paired.left())
+                && pair.right().equals(paired.right()));
+        assertThat(detached.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.CLASS)
+                .filter(node -> paired.left().equals(node.left()) || paired.right().equals(node.right())))
+                .hasSize(2);
+
+        WorkspaceController.Workspace automatic = awaitMapping(
+                (success, failure) -> controller.restoreDetached(paired.left(), success, failure));
+        assertThat(automatic.detachedPairs()).isEmpty();
+        assertThat(automatic.differences().nodes()).anyMatch(node -> paired.left().equals(node.left())
+                && paired.right().equals(node.right()));
+
+        WorkspaceController.Workspace undone = awaitMapping(controller::undoMappings);
+        assertThat(undone.detachedPairs()).isNotEmpty();
+        controller.close();
+    }
+
+    @Test
     void confirmsPersistsAndRestoresASingleSidedAdditionAsAnUndoableEdit() throws Exception {
         Path left = jar("resolution-old.jar", Map.of("same/Owner", "read"));
         Path right = jar("resolution-new.jar", Map.of("same/Owner", "read", "new/Added", "value"));
@@ -197,6 +230,27 @@ class WorkspaceControllerTest {
     }
 
     @Test
+    void confirmsMultipleAdditionsAsOneUndoableBatch() throws Exception {
+        Path left = jar("batch-old.jar", Map.of("same/Owner", "read"));
+        Path right = jar("batch-new.jar", Map.of(
+                "same/Owner", "read", "new/First", "one", "new/Second", "two"));
+        WorkspaceController controller = new WorkspaceController();
+        WorkspaceController.Workspace compared = compare(controller, left, right);
+        List<DiffNode> additions = compared.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.CLASS && node.left() == null && node.right() != null)
+                .toList();
+
+        WorkspaceController.Workspace confirmed = awaitMapping(
+                (success, failure) -> controller.confirmSingleSided(additions, success, failure));
+        assertThat(confirmed.confirmedAdded()).containsAll(additions.stream().map(DiffNode::right).toList());
+
+        WorkspaceController.Workspace undone = awaitMapping(controller::undoMappings);
+        assertThat(undone.confirmedAdded()).doesNotContainAnyElementsOf(
+                additions.stream().map(DiffNode::right).toList());
+        controller.close();
+    }
+
+    @Test
     void loadsOwningClassBytecodeAndSourceForAMethodNode() throws Exception {
         Path left = jar("member-old.jar", "example/Owner", "read");
         Path right = jar("member-new.jar", "a/b", "x");
@@ -215,6 +269,31 @@ class WorkspaceControllerTest {
 
         assertThat(bytecode).contains("read()I");
         assertThat(source).contains("read(");
+        controller.close();
+    }
+
+    @Test
+    void classifiesPairedClassesWithoutRecomputingAnalysisAndSupportsUndo() throws Exception {
+        Path left = jar("classification-old.jar", "example/Owner", "read");
+        Path right = jar("classification-new.jar", "a/b", "x");
+        WorkspaceController controller = controllerWithLocalCache();
+        WorkspaceController.Workspace compared = compare(controller, left, right);
+        DiffNode paired = compared.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.CLASS && node.left() != null && node.right() != null)
+                .findFirst().orElseThrow();
+
+        WorkspaceController.Workspace classified = awaitMapping((success, failure) -> controller.classifyClass(
+                paired, ClassClassification.FORCE_UNCHANGED, success, failure));
+
+        assertThat(classified.matches()).isSameAs(compared.matches());
+        assertThat(classified.differences()).isSameAs(compared.differences());
+        assertThat(classified.overrides().classifications()).containsEntry(
+                new ClassPair(paired.left(), paired.right()), ClassClassification.FORCE_UNCHANGED);
+        assertThat(controller.hasUnsavedChanges()).isTrue();
+
+        WorkspaceController.Workspace undone = awaitMapping(controller::undoMappings);
+        assertThat(undone.overrides().classifications()).isEmpty();
+        assertThat(undone.matches()).isSameAs(compared.matches());
         controller.close();
     }
 

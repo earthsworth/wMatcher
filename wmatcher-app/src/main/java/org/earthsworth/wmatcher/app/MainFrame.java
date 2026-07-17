@@ -48,8 +48,8 @@ public final class MainFrame extends JFrame {
         super(text("app.title"));
         this.controller = controller;
         setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
-        setMinimumSize(new Dimension(1000, 680));
-        setSize(1440, 900);
+        setMinimumSize(new Dimension(800, 500));
+        setSize(800, 500);
         setLocationRelativeTo(null);
         setJMenuBar(menuBar());
         setLayout(new BorderLayout());

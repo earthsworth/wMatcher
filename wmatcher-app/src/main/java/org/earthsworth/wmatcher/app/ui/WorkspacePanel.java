@@ -8,9 +8,14 @@ import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GridLayout;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.RenderingHints;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.Enumeration;
@@ -34,11 +39,14 @@ import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JPopupMenu;
+import javax.swing.JProgressBar;
 import javax.swing.JTabbedPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.JTree;
+import javax.swing.Icon;
+import javax.swing.ToolTipManager;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 import javax.swing.event.DocumentEvent;
@@ -52,6 +60,8 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import org.earthsworth.wmatcher.app.WorkspaceController;
 import org.earthsworth.wmatcher.core.model.ChangeKind;
+import org.earthsworth.wmatcher.core.model.ClassClassification;
+import org.earthsworth.wmatcher.core.model.ClassPair;
 import org.earthsworth.wmatcher.core.model.ClassModel;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.EntityId;
@@ -64,8 +74,11 @@ import org.earthsworth.wmatcher.core.model.ResolutionStatus;
 import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class WorkspacePanel extends JPanel {
+    private static final Logger LOGGER = LoggerFactory.getLogger(WorkspacePanel.class);
     private static final int STRUCTURE_TAB = 2;
     private static final int BYTECODE_TAB = 3;
     private static final int SOURCE_TAB = 4;
@@ -84,6 +97,8 @@ public final class WorkspacePanel extends JPanel {
     private final JButton unlockCandidate = new JButton(text("candidate.unlock"));
     private final JButton manualCandidate = new JButton(text("candidate.manual"));
     private final JButton resolutionAction = new JButton();
+    private final JButton restorePending = new JButton(text("candidate.restorePending"));
+    private final JProgressBar operationProgress = new JProgressBar();
     private final SideBySideTextPanel structure = new SideBySideTextPanel();
     private final SideBySideTextPanel bytecode = new SideBySideTextPanel();
     private final SideBySideTextPanel source = new SideBySideTextPanel();
@@ -97,6 +112,9 @@ public final class WorkspacePanel extends JPanel {
     private long sourceGeneration = -1;
     private int restoredScrollPosition;
     private boolean restoringTreeState;
+    private boolean mappingBusy;
+    private List<TreeItem> allItems = List.of();
+    private final Map<String, DefaultMutableTreeNode> treeNodeIndex = new HashMap<>();
 
     public WorkspacePanel(
             WorkspaceController controller,
@@ -112,18 +130,29 @@ public final class WorkspacePanel extends JPanel {
     }
 
     public void refresh(WorkspaceController.Workspace updated) {
+        WorkspaceController.Workspace previous = workspace;
         workspace = updated;
-        long changed = updated.differences().nodes().stream()
-                .filter(node -> treeStatus(node) == TreeStatus.CHANGED)
-                .count();
-        summary.update(
-                updated.left().classes().size(),
-                updated.right().classes().size(),
-                updated.matches().confirmed().size(),
-                updated.matches().candidates().size(),
-                changed);
+        boolean classificationOnly = previous != null && previous.matches() == updated.matches()
+                && previous.differences() == updated.differences() && !allItems.isEmpty();
+        allItems = classificationOnly ? reclassify(allItems) : allTreeItems();
+        updateSummary();
         String selectedKey = selected == null ? "" : stableNodeKey(selected);
         rebuildTree(selectedKey);
+    }
+
+    private List<TreeItem> reclassify(List<TreeItem> items) {
+        return items.stream().map(item -> {
+            DiffNode node = item.node();
+            if (node.kind() != EntityKind.CLASS || node.left() == null || node.right() == null) return item;
+            ClassClassification classification = workspace.overrides().classifications().getOrDefault(
+                    new ClassPair(node.left(), node.right()), ClassClassification.AUTO);
+            TreeStatus status = switch (classification) {
+                case FORCE_CHANGED -> TreeStatus.CHANGED;
+                case FORCE_UNCHANGED -> TreeStatus.UNCHANGED;
+                case AUTO -> item.automaticStatus();
+            };
+            return new TreeItem(node, item.members(), item.automaticStatus(), status, classification);
+        }).toList();
     }
 
     public ProjectUiState uiState() {
@@ -154,6 +183,10 @@ public final class WorkspacePanel extends JPanel {
         JPanel top = new JPanel(new BorderLayout());
         top.setBorder(BorderFactory.createEmptyBorder(7, 10, 7, 10));
         top.add(summary, BorderLayout.WEST);
+        operationProgress.setIndeterminate(true);
+        operationProgress.setPreferredSize(new java.awt.Dimension(110, 18));
+        operationProgress.setVisible(false);
+        top.add(operationProgress, BorderLayout.EAST);
         add(top, BorderLayout.NORTH);
 
         JPanel navigation = new JPanel(new BorderLayout());
@@ -174,9 +207,11 @@ public final class WorkspacePanel extends JPanel {
         tree.setRootVisible(false);
         tree.setShowsRootHandles(true);
         tree.setCellRenderer(new DiffTreeRenderer());
+        ToolTipManager.sharedInstance().registerComponent(tree);
         tree.addTreeExpansionListener(new TreeExpansionListener() {
             @Override
             public void treeExpanded(TreeExpansionEvent event) {
+                materializeMembers(event.getPath());
                 if (!restoringTreeState) {
                     treeEntry(event.getPath()).ifPresent(entry -> expandedTreeKeys.add(
                             expansionStateKey(entry.stableKey())));
@@ -263,6 +298,27 @@ public final class WorkspacePanel extends JPanel {
         filter.addActionListener(event -> rebuildTree(""));
     }
 
+    private void materializeMembers(TreePath path) {
+        Object value = path.getLastPathComponent();
+        if (!(value instanceof DefaultMutableTreeNode node)
+                || !(node.getUserObject() instanceof TreeEntry entry)
+                || entry.members().isEmpty()
+                || node.getChildCount() != 1) {
+            return;
+        }
+        Object child = ((DefaultMutableTreeNode) node.getChildAt(0)).getUserObject();
+        if (!(child instanceof TreeEntry placeholder) || !placeholder.stableKey().startsWith("placeholder:")) {
+            return;
+        }
+        node.removeAllChildren();
+        String query = search.getText().trim().toLowerCase(Locale.ROOT);
+        entry.members().stream()
+                .filter(member -> query.isEmpty() || memberMatches(member, query))
+                .forEach(member -> node.add(memberNode(member)));
+        ((DefaultTreeModel) tree.getModel()).reload(node);
+        SwingUtilities.invokeLater(() -> tree.expandPath(path));
+    }
+
     private void applyUiState(ProjectUiState state) {
         expandedTreeKeys.clear();
         expandedTreeKeys.addAll(migrateExpandedTreeKeys(state.expandedTreeKeys()));
@@ -294,10 +350,12 @@ public final class WorkspacePanel extends JPanel {
         unlockCandidate.addActionListener(event -> unlockSelected());
         manualCandidate.addActionListener(event -> chooseManual());
         resolutionAction.addActionListener(event -> toggleSingleSidedResolution());
+        restorePending.addActionListener(event -> restoreCurrentToPending());
         actions.add(lockCandidate);
         actions.add(unlockCandidate);
         actions.add(manualCandidate);
         actions.add(resolutionAction);
+        actions.add(restorePending);
         panel.add(actions, BorderLayout.SOUTH);
         updateCandidateActions();
         return panel;
@@ -311,28 +369,40 @@ public final class WorkspacePanel extends JPanel {
             effectiveScroll = restoredScrollPosition;
             restoredScrollPosition = 0;
         }
-        Map<String, DiffNode> uniqueVisible = new java.util.LinkedHashMap<>();
-        workspace.differences().nodes().stream()
-                .filter(this::visible)
-                .forEach(node -> uniqueVisible.putIfAbsent(stableNodeKey(node), node));
-        List<DiffNode> visible = List.copyOf(uniqueVisible.values());
-        Map<TreeStatus, List<DiffNode>> statusGroups = new EnumMap<>(TreeStatus.class);
+        List<TreeItem> visible = treeItems();
+        Map<TreeStatus, List<TreeItem>> statusGroups = new EnumMap<>(TreeStatus.class);
         for (TreeStatus status : TreeStatus.values()) {
             statusGroups.put(status, new ArrayList<>());
         }
-        visible.forEach(node -> statusGroups.get(treeStatus(node)).add(node));
+        visible.forEach(item -> statusGroups.get(item.status()).add(item));
         for (TreeStatus status : TreeStatus.values()) {
-            List<DiffNode> nodes = statusGroups.get(status);
-            if (!nodes.isEmpty()) {
-                addStatusGroup(root, status, nodes);
+            List<TreeItem> items = statusGroups.get(status);
+            if (!items.isEmpty()) {
+                addStatusGroup(root, status, items);
             }
         }
         restoringTreeState = true;
         try {
-            tree.setModel(new DefaultTreeModel(root));
+            if (tree.getModel() instanceof DefaultTreeModel model) {
+                model.setRoot(root);
+            } else {
+                tree.setModel(new DefaultTreeModel(root));
+            }
+            rebuildTreeIndex(root);
             restoreExpandedPaths(root);
             if (!effectiveSelection.isBlank()) {
                 TreePath selectedPath = findTreePath(root, effectiveSelection);
+                if (selectedPath == null && selected != null
+                        && (selected.kind() == EntityKind.FIELD || selected.kind() == EntityKind.METHOD)) {
+                    DiffNode owner = mappingNode(selected);
+                    if (owner != null) {
+                        TreePath ownerPath = findTreePath(root, stableNodeKey(owner));
+                        if (ownerPath != null) {
+                            materializeMembers(ownerPath);
+                            selectedPath = findTreePath(root, effectiveSelection);
+                        }
+                    }
+                }
                 if (selectedPath != null) {
                     tree.setSelectionPath(selectedPath);
                     tree.scrollPathToVisible(selectedPath);
@@ -345,137 +415,161 @@ public final class WorkspacePanel extends JPanel {
         SwingUtilities.invokeLater(() -> treeScrollPane.getVerticalScrollBar().setValue(scrollToRestore));
     }
 
-    private void addStatusGroup(DefaultMutableTreeNode root, TreeStatus status, List<DiffNode> nodes) {
+    private List<TreeItem> treeItems() {
+        return allItems.stream().filter(this::visible).toList();
+    }
+
+    private List<TreeItem> allTreeItems() {
+        Map<String, TreeItemBuilder> classOwners = new HashMap<>();
+        List<TreeItemBuilder> classes = new ArrayList<>();
+        List<TreeItem> resources = new ArrayList<>();
+        for (DiffNode node : workspace.differences().nodes()) {
+            if (node.kind() == EntityKind.CLASS) {
+                ClassPair pair = node.left() != null && node.right() != null
+                        ? new ClassPair(node.left(), node.right()) : null;
+                ClassClassification classification = pair == null ? ClassClassification.AUTO
+                        : workspace.overrides().classifications().getOrDefault(pair, ClassClassification.AUTO);
+                TreeItemBuilder builder = new TreeItemBuilder(node, classification);
+                classes.add(builder);
+                if (node.left() != null) classOwners.put("L:" + node.left().name(), builder);
+                if (node.right() != null) classOwners.put("R:" + node.right().name(), builder);
+            } else if (node.kind() == EntityKind.RESOURCE) {
+                TreeStatus status = treeStatus(node);
+                resources.add(new TreeItem(node, List.of(), status, status, ClassClassification.AUTO));
+            }
+        }
+        for (DiffNode node : workspace.differences().nodes()) {
+            if (node.kind() != EntityKind.FIELD && node.kind() != EntityKind.METHOD) continue;
+            TreeItemBuilder owner = node.left() == null ? null : classOwners.get("L:" + node.left().owner());
+            if (owner == null && node.right() != null) owner = classOwners.get("R:" + node.right().owner());
+            if (owner != null) owner.members.add(node);
+        }
+        List<TreeItem> result = new ArrayList<>();
+        classes.stream().map(TreeItemBuilder::build).forEach(result::add);
+        result.addAll(resources);
+        return result;
+    }
+
+    private void addStatusGroup(DefaultMutableTreeNode root, TreeStatus status, List<TreeItem> items) {
         DefaultMutableTreeNode statusRoot = new DefaultMutableTreeNode(new TreeEntry(
-                "status:" + status.key(), text(status.messageKey()) + " (" + nodes.size() + ')', null));
+                "status:" + status.key(), text(status.messageKey()) + " (" + items.size() + ')', null));
         root.add(statusRoot);
-        List<DiffNode> classes = nodes.stream()
-                .filter(node -> node.kind() == EntityKind.CLASS)
-                .toList();
-        Map<String, DefaultMutableTreeNode> classNodes = new HashMap<>();
-        if (!classes.isEmpty()) {
-            DefaultMutableTreeNode classRoot = new DefaultMutableTreeNode(new TreeEntry(
-                    "status:" + status.key() + ":classes", text("tree.classes"), null));
-            statusRoot.add(classRoot);
-            addClasses(status, classRoot, classes, classNodes);
-        }
-        List<DiffNode> detachedMembers = new ArrayList<>();
-        nodes.stream().filter(node -> node.kind() == EntityKind.FIELD || node.kind() == EntityKind.METHOD)
-                .forEach(node -> {
-                    EntityId id = node.left() != null ? node.left() : node.right();
-                    DefaultMutableTreeNode parent = classNodes.get(id.owner());
-                    if (parent == null) {
-                        detachedMembers.add(node);
-                    } else {
-                        parent.add(memberNode(node));
-                    }
-                });
-        if (!detachedMembers.isEmpty()) {
-            DefaultMutableTreeNode memberRoot = new DefaultMutableTreeNode(new TreeEntry(
-                    "status:" + status.key() + ":members", text("tree.members"), null));
-            statusRoot.add(memberRoot);
-            addDetachedMembers(status, memberRoot, detachedMembers);
-        }
-        List<DiffNode> resources = nodes.stream()
-                .filter(node -> node.kind() == EntityKind.RESOURCE)
-                .toList();
-        if (!resources.isEmpty()) {
-            DefaultMutableTreeNode resourceRoot = new DefaultMutableTreeNode(new TreeEntry(
-                    "status:" + status.key() + ":resources", text("tree.resources"), null));
-            statusRoot.add(resourceRoot);
-            addResources(status, resourceRoot, resources);
+        if (status == TreeStatus.UNMATCHED) {
+            addUnmatchedSides(statusRoot, items);
+        } else {
+            addTypedItems(statusRoot, status.key(), items);
         }
     }
 
-    private void addClasses(
-            TreeStatus status,
-            DefaultMutableTreeNode classRoot,
-            List<DiffNode> nodes,
-            Map<String, DefaultMutableTreeNode> classNodes) {
+    private void addUnmatchedSides(DefaultMutableTreeNode statusRoot, List<TreeItem> items) {
+        for (TreeSide side : TreeSide.values()) {
+            List<TreeItem> sideItems = items.stream().filter(item -> side.matches(item.node())).toList();
+            if (sideItems.isEmpty()) continue;
+            DefaultMutableTreeNode sideRoot = new DefaultMutableTreeNode(new TreeEntry(
+                    "status:unmatched:" + side.key, text(side.messageKey) + " (" + sideItems.size() + ')', null));
+            statusRoot.add(sideRoot);
+            addTypedItems(sideRoot, "unmatched:" + side.key, sideItems);
+        }
+    }
+
+    private void addTypedItems(DefaultMutableTreeNode root, String namespace, List<TreeItem> items) {
+        List<TreeItem> classes = items.stream().filter(item -> item.node().kind() == EntityKind.CLASS).toList();
+        if (!classes.isEmpty()) {
+            DefaultMutableTreeNode classRoot = new DefaultMutableTreeNode(new TreeEntry(
+                    "status:" + namespace + ":classes", text("tree.classes"), null));
+            root.add(classRoot);
+            addClasses(namespace, classRoot, classes);
+        }
+        List<TreeItem> resources = items.stream().filter(item -> item.node().kind() == EntityKind.RESOURCE).toList();
+        if (!resources.isEmpty()) {
+            DefaultMutableTreeNode resourceRoot = new DefaultMutableTreeNode(new TreeEntry(
+                    "status:" + namespace + ":resources", text("tree.resources"), null));
+            root.add(resourceRoot);
+            addResources(namespace, resourceRoot, resources);
+        }
+    }
+
+    private void addClasses(String namespace, DefaultMutableTreeNode classRoot, List<TreeItem> items) {
         Map<String, DefaultMutableTreeNode> packages = new HashMap<>();
-        nodes.forEach(node -> {
+        String query = search.getText().trim().toLowerCase(Locale.ROOT);
+        items.forEach(item -> {
+            DiffNode node = item.node();
             String className = entityName(node);
             int slash = className.lastIndexOf('/');
             String packageName = slash < 0 ? "" : className.substring(0, slash);
             String simpleName = slash < 0 ? className : className.substring(slash + 1);
             DefaultMutableTreeNode parent = packageNode(classRoot, packages,
-                    status.key() + ":classes", packageName);
+                    namespace + ":classes", packageName);
+            String classLabel = label(simpleName, node);
             DefaultMutableTreeNode classNode = new DefaultMutableTreeNode(
-                    new TreeEntry(stableNodeKey(node), label(simpleName, node), node));
+                    new TreeEntry(stableNodeKey(node), classLabel, node, item.members(), item.classification()));
             parent.add(classNode);
-            if (node.left() != null) {
-                classNodes.put(node.left().name(), classNode);
-            }
-            if (node.right() != null) {
-                classNodes.put(node.right().name(), classNode);
+            if (!item.members().isEmpty()) {
+                if (query.isEmpty()) {
+                    classNode.add(new DefaultMutableTreeNode(new TreeEntry(
+                            "placeholder:" + stableNodeKey(node), "…", null)));
+                } else {
+                    item.members().stream().filter(member -> memberMatches(member, query))
+                            .forEach(member -> classNode.add(memberNode(member)));
+                }
             }
         });
     }
 
     private static DefaultMutableTreeNode memberNode(DiffNode node) {
         EntityId id = node.left() != null ? node.left() : node.right();
+        String marker = node.left() == null ? "+ " : node.right() == null ? "− "
+                : node.changed() ? "~ " : "  ";
         return new DefaultMutableTreeNode(new TreeEntry(
-                stableNodeKey(node), label(id.name() + id.descriptor(), node), node));
-    }
-
-    private static void addDetachedMembers(
-            TreeStatus status,
-            DefaultMutableTreeNode memberRoot,
-            List<DiffNode> members) {
-        Map<String, DefaultMutableTreeNode> packages = new HashMap<>();
-        Map<String, DefaultMutableTreeNode> owners = new HashMap<>();
-        for (DiffNode member : members) {
-            EntityId primary = member.left() != null ? member.left() : member.right();
-            String owner = primary.owner();
-            int slash = owner.lastIndexOf('/');
-            String packageName = slash < 0 ? "" : owner.substring(0, slash);
-            String simpleName = slash < 0 ? owner : owner.substring(slash + 1);
-            DefaultMutableTreeNode packageNode = packageNode(memberRoot, packages,
-                    status.key() + ":members", packageName);
-            String side = member.left() != null ? "L:" : "R:";
-            String ownerKey = "member-owner:" + status.key() + ':' + side + owner;
-            DefaultMutableTreeNode ownerNode = owners.computeIfAbsent(ownerKey, ignored -> {
-                DefaultMutableTreeNode created = new DefaultMutableTreeNode(new TreeEntry(
-                        ownerKey, simpleName + "  " + text("tree.memberContainer"), null));
-                packageNode.add(created);
-                return created;
-            });
-            ownerNode.add(memberNode(member));
-        }
+                stableNodeKey(node), marker + id.name() + id.descriptor(), node));
     }
 
     private static void addResources(
-            TreeStatus status,
+            String namespace,
             DefaultMutableTreeNode resourceRoot,
-            List<DiffNode> resources) {
+            List<TreeItem> resources) {
         Map<String, DefaultMutableTreeNode> resourceDirectories = new HashMap<>();
-        resources.forEach(node -> {
+        resources.forEach(item -> {
+            DiffNode node = item.node();
             String name = entityName(node);
             int slash = name.lastIndexOf('/');
             String directory = slash < 0 ? "" : name.substring(0, slash);
             String simple = slash < 0 ? name : name.substring(slash + 1);
             DefaultMutableTreeNode parent = packageNode(resourceRoot, resourceDirectories,
-                    status.key() + ":resources", directory);
+                    namespace + ":resources", directory);
             parent.add(new DefaultMutableTreeNode(
                     new TreeEntry(stableNodeKey(node), label(simple, node), node)));
         });
     }
 
-    private boolean visible(DiffNode node) {
+    private boolean visible(TreeItem item) {
+        DiffNode node = item.node();
         String query = search.getText().trim().toLowerCase(Locale.ROOT);
-        if (!query.isEmpty() && !node.displayName().toLowerCase(Locale.ROOT).contains(query)) {
+        if (!query.isEmpty() && !node.displayName().toLowerCase(Locale.ROOT).contains(query)
+                && item.members().stream().noneMatch(member -> memberMatches(member, query))) {
             return false;
         }
         FilterOption option = (FilterOption) filter.getSelectedItem();
         FilterKind kind = option == null ? FilterKind.ALL : option.kind();
         return switch (kind) {
             case ALL -> true;
-            case CHANGED -> treeStatus(node) == TreeStatus.CHANGED;
-            case ADDED -> node.changes().contains(ChangeKind.ADDED);
-            case REMOVED -> node.changes().contains(ChangeKind.REMOVED);
-            case MODIFIED -> treeStatus(node) == TreeStatus.CHANGED;
-            case UNRESOLVED -> node.changes().contains(ChangeKind.UNRESOLVED);
+            case CHANGED -> item.status() == TreeStatus.CHANGED;
+            case ADDED -> hasChange(item, ChangeKind.ADDED);
+            case REMOVED -> hasChange(item, ChangeKind.REMOVED);
+            case MODIFIED -> item.status() == TreeStatus.CHANGED;
+            case UNRESOLVED -> hasChange(item, ChangeKind.UNRESOLVED);
         };
+    }
+
+    private static boolean memberMatches(DiffNode member, String query) {
+        return member.displayName().toLowerCase(Locale.ROOT).contains(query)
+                || (member.left() != null && member.left().externalName().toLowerCase(Locale.ROOT).contains(query))
+                || (member.right() != null && member.right().externalName().toLowerCase(Locale.ROOT).contains(query));
+    }
+
+    private static boolean hasChange(TreeItem item, ChangeKind kind) {
+        return item.node().changes().contains(kind)
+                || item.members().stream().anyMatch(member -> member.changes().contains(kind));
     }
 
     private static TreeStatus treeStatus(DiffNode node) {
@@ -485,7 +579,11 @@ public final class WorkspacePanel extends JPanel {
         if (node.left() == null || node.right() == null || node.changes().contains(ChangeKind.UNRESOLVED)) {
             return TreeStatus.UNMATCHED;
         }
-        return node.changed() ? TreeStatus.CHANGED : TreeStatus.UNCHANGED;
+        return hasSubstantiveChange(node) ? TreeStatus.CHANGED : TreeStatus.UNCHANGED;
+    }
+
+    private static boolean hasSubstantiveChange(DiffNode node) {
+        return node.changes().stream().anyMatch(change -> change != ChangeKind.RENAMED);
     }
 
     static int detailTabForSelection(EntityKind kind, int activeTab) {
@@ -609,12 +707,13 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void updateCandidates(DiffNode node) {
-        if (node.left() == null) {
+        DiffNode subject = mappingNode(node);
+        if (subject == null || subject.left() == null) {
             candidateModel.setRows(List.of());
             updateCandidateActions();
             return;
         }
-        EntityId left = node.left();
+        EntityId left = subject.left();
         MatchDecision current = currentMatch(left);
         List<CandidateRow> rows = new ArrayList<>();
         if (current != null) {
@@ -644,58 +743,187 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void unlockSelected() {
-        if (selected != null && selected.left() != null) {
-            controller.unlockMapping(selected.left(), this::mappingChanged, errorHandler);
+        DiffNode subject = mappingNode(selected);
+        if (subject != null && subject.left() != null) {
+            runMappingOperation(() -> controller.restoreAutomatic(
+                    subject.left(), this::mappingChanged, this::mappingFailed));
         }
     }
 
     private void toggleSingleSidedResolution() {
-        if (selected == null || (selected.left() == null) == (selected.right() == null)) {
+        DiffNode subject = mappingNode(selected);
+        if (subject == null || (subject.left() == null) == (subject.right() == null)) {
             return;
         }
-        if (selected.resolution() == ResolutionStatus.NONE) {
-            controller.confirmSingleSided(selected, this::mappingChanged, errorHandler);
+        if (subject.resolution() == ResolutionStatus.NONE) {
+            runMappingOperation(() -> controller.confirmSingleSided(
+                    subject, this::mappingChanged, this::mappingFailed));
         } else {
-            controller.clearSingleSidedResolution(selected, this::mappingChanged, errorHandler);
+            runMappingOperation(() -> controller.clearSingleSidedResolution(
+                    subject, this::mappingChanged, this::mappingFailed));
         }
+    }
+
+    private void restoreCurrentToPending() {
+        DiffNode subject = mappingNode(selected);
+        if (subject != null && subject.left() != null && subject.right() != null) {
+            runMappingOperation(() -> controller.detachMapping(subject, this::mappingChanged, this::mappingFailed));
+        }
+    }
+
+    private void runMappingOperation(Runnable operation) {
+        if (mappingBusy) return;
+        mappingBusy = true;
+        operationProgress.setVisible(true);
+        updateCandidateActions();
+        operation.run();
+    }
+
+    private void mappingFailed(Throwable throwable) {
+        mappingBusy = false;
+        operationProgress.setVisible(false);
+        updateCandidateActions();
+        errorHandler.accept(throwable);
     }
 
     private void showTreeMenu(MouseEvent event) {
         if (!event.isPopupTrigger()) {
             return;
         }
-        TreePath path = tree.getPathForLocation(event.getX(), event.getY());
-        if (path == null) {
-            return;
-        }
+        TreePath path = popupPathAt(tree, event.getX(), event.getY());
+        if (path == null) return;
         tree.setSelectionPath(path);
         java.util.Optional<TreeEntry> entry = treeEntry(path);
-        if (entry.isEmpty() || entry.get().node() == null) {
+        if (entry.isEmpty()) {
+            return;
+        }
+        JPopupMenu menu = new JPopupMenu();
+        if (entry.get().node() == null) {
+            TreeSide side = sideForKey(entry.get().stableKey());
+            List<DiffNode> descendants = collectSingleSided((DefaultMutableTreeNode) path.getLastPathComponent());
+            if (side != null && !descendants.isEmpty()) {
+                JMenuItem batch = new JMenuItem(text(side == TreeSide.OLD
+                        ? "resolution.confirmDirectoryRemoved" : "resolution.confirmDirectoryAdded",
+                        descendants.size()));
+                batch.addActionListener(ignored -> confirmDirectory(descendants, side));
+                menu.add(batch);
+            }
+            if (menu.getComponentCount() > 0) menu.show(tree, event.getX(), event.getY());
             return;
         }
         DiffNode node = entry.get().node();
-        if ((node.left() == null) == (node.right() == null)) {
-            return;
+        if (node.kind() == EntityKind.FIELD || node.kind() == EntityKind.METHOD) return;
+        if ((node.left() == null) != (node.right() == null)) {
+            JMenuItem item = new JMenuItem(resolutionLabel(node));
+            item.addActionListener(ignored -> toggleSingleSidedResolution());
+            menu.add(item);
+            EntityId id = node.left() != null ? node.left() : node.right();
+            if (workspace.detachedPairs().stream().anyMatch(pair -> pair.involves(id))) {
+                JMenuItem automatic = new JMenuItem(text("candidate.restoreAutomatic"));
+                automatic.addActionListener(ignored -> runMappingOperation(() -> controller.restoreDetached(
+                        id, this::mappingChanged, this::mappingFailed)));
+                menu.add(automatic);
+            }
+        } else if (node.left() != null) {
+            JMenuItem restore = new JMenuItem(text("candidate.restorePending"));
+            restore.addActionListener(ignored -> restoreCurrentToPending());
+            menu.add(restore);
+            if (workspace.lockedMappings().containsKey(node.left())) {
+                JMenuItem automatic = new JMenuItem(text("candidate.restoreAutomatic"));
+                automatic.addActionListener(ignored -> unlockSelected());
+                menu.add(automatic);
+            }
+            if (node.kind() == EntityKind.CLASS) {
+                if (menu.getComponentCount() > 0) menu.addSeparator();
+                addClassificationActions(menu, node);
+            }
         }
-        JMenuItem item = new JMenuItem(resolutionLabel(node));
-        item.addActionListener(ignored -> toggleSingleSidedResolution());
-        JPopupMenu menu = new JPopupMenu();
-        menu.add(item);
-        menu.show(tree, event.getX(), event.getY());
+        if (menu.getComponentCount() > 0) menu.show(tree, event.getX(), event.getY());
+    }
+
+    static TreePath popupPathAt(JTree tree, int x, int y) {
+        int row = tree.getClosestRowForLocation(x, y);
+        if (row < 0) return null;
+        Rectangle bounds = tree.getRowBounds(row);
+        if (bounds == null || y < bounds.y || y >= bounds.y + bounds.height) return null;
+        return tree.getPathForRow(row);
+    }
+
+    private void addClassificationActions(JPopupMenu menu, DiffNode node) {
+        ClassPair pair = new ClassPair(node.left(), node.right());
+        ClassClassification current = workspace.overrides().classifications()
+                .getOrDefault(pair, ClassClassification.AUTO);
+        if (current != ClassClassification.FORCE_CHANGED) {
+            JMenuItem changed = new JMenuItem(text("classification.forceChanged"));
+            changed.addActionListener(ignored -> classify(node, ClassClassification.FORCE_CHANGED));
+            menu.add(changed);
+        }
+        if (current != ClassClassification.FORCE_UNCHANGED) {
+            JMenuItem unchanged = new JMenuItem(text("classification.forceUnchanged"));
+            unchanged.addActionListener(ignored -> classify(node, ClassClassification.FORCE_UNCHANGED));
+            menu.add(unchanged);
+        }
+        if (current != ClassClassification.AUTO) {
+            JMenuItem automatic = new JMenuItem(text("classification.restoreAutomatic"));
+            automatic.addActionListener(ignored -> classify(node, ClassClassification.AUTO));
+            menu.add(automatic);
+        }
+    }
+
+    private void classify(DiffNode node, ClassClassification classification) {
+        runMappingOperation(() -> controller.classifyClass(
+                node, classification, this::mappingChanged, this::mappingFailed));
+    }
+
+    private void confirmDirectory(List<DiffNode> nodes, TreeSide side) {
+        int answer = JOptionPane.showConfirmDialog(this,
+                text(side == TreeSide.OLD ? "dialog.confirmDirectoryRemoved" : "dialog.confirmDirectoryAdded",
+                        nodes.size()),
+                text("dialog.confirmDirectoryTitle"), JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (answer == JOptionPane.OK_OPTION) {
+            runMappingOperation(() -> controller.confirmSingleSided(
+                    nodes, this::mappingChanged, this::mappingFailed));
+        }
+    }
+
+    private static TreeSide sideForKey(String key) {
+        if (key.contains("unmatched:old")) return TreeSide.OLD;
+        if (key.contains("unmatched:new")) return TreeSide.NEW;
+        return null;
+    }
+
+    private static List<DiffNode> collectSingleSided(DefaultMutableTreeNode root) {
+        Map<String, DiffNode> result = new java.util.LinkedHashMap<>();
+        collectSingleSided(root, result);
+        return List.copyOf(result.values());
+    }
+
+    private static void collectSingleSided(DefaultMutableTreeNode node, Map<String, DiffNode> target) {
+        if (node.getUserObject() instanceof TreeEntry entry && entry.node() != null) {
+            DiffNode diff = entry.node();
+            if ((diff.kind() == EntityKind.CLASS || diff.kind() == EntityKind.RESOURCE)
+                    && (diff.left() == null) != (diff.right() == null)) {
+                target.put(stableNodeKey(diff), diff);
+            }
+        }
+        for (int index = 0; index < node.getChildCount(); index++) {
+            collectSingleSided((DefaultMutableTreeNode) node.getChildAt(index), target);
+        }
     }
 
     private static String resolutionLabel(DiffNode node) {
         if (node.resolution() != ResolutionStatus.NONE) {
-            return text("resolution.restore");
+            return text("candidate.restorePending");
         }
         return node.left() == null ? text("resolution.confirmAdded") : text("resolution.confirmRemoved");
     }
 
     private void chooseManual() {
-        if (selected == null || selected.left() == null) {
+        DiffNode subject = mappingNode(selected);
+        if (subject == null || subject.left() == null || subject.kind() == EntityKind.RESOURCE) {
             return;
         }
-        EntityId left = selected.left();
+        EntityId left = subject.left();
         List<ManualMatchDialog.Choice> choices = manualChoices(left);
         if (choices.isEmpty()) {
             JOptionPane.showMessageDialog(this, text("dialog.noManualTargets"), text("candidate.manual"),
@@ -753,7 +981,7 @@ public final class WorkspacePanel extends JPanel {
                 JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION)) {
             return;
         }
-        controller.lockMapping(decision, this::mappingChanged, errorHandler);
+        runMappingOperation(() -> controller.confirmMapping(decision, this::mappingChanged, this::mappingFailed));
     }
 
     static boolean replacementAccepted(
@@ -771,21 +999,37 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void updateCandidateActions() {
+        DiffNode subject = mappingNode(selected);
         int viewRow = candidates.getSelectedRow();
         CandidateRow row = viewRow < 0 ? null
                 : candidateModel.row(candidates.convertRowIndexToModel(viewRow));
-        boolean alreadyLocked = row != null && row.current()
-                && row.decision().status() == MatchStatus.MANUAL_LOCKED;
-        lockCandidate.setEnabled(row != null && !alreadyLocked);
-        unlockCandidate.setEnabled(selected != null && selected.left() != null
-                && workspace.lockedMappings().containsKey(selected.left()));
-        manualCandidate.setEnabled(selected != null && selected.left() != null
-                && selected.left().kind() != EntityKind.RESOURCE);
-        boolean singleSided = selected != null && (selected.left() == null) != (selected.right() == null);
+        boolean alreadyConfirmed = row != null && row.current()
+                && row.decision().status() == MatchStatus.MANUAL_CONFIRMED;
+        lockCandidate.setVisible(row != null && !alreadyConfirmed);
+        lockCandidate.setEnabled(row != null && !alreadyConfirmed);
+        boolean manual = subject != null && subject.left() != null
+                && workspace.lockedMappings().containsKey(subject.left());
+        unlockCandidate.setVisible(manual);
+        unlockCandidate.setEnabled(manual);
+        boolean canChoose = subject != null && subject.left() != null && subject.kind() == EntityKind.CLASS;
+        manualCandidate.setVisible(canChoose);
+        manualCandidate.setEnabled(canChoose);
+        boolean singleSided = subject != null && (subject.left() == null) != (subject.right() == null);
         resolutionAction.setVisible(singleSided);
         resolutionAction.setEnabled(singleSided);
         if (singleSided) {
-            resolutionAction.setText(resolutionLabel(selected));
+            resolutionAction.setText(resolutionLabel(subject));
+        }
+        boolean paired = subject != null && subject.left() != null && subject.right() != null
+                && (subject.kind() == EntityKind.CLASS || subject.kind() == EntityKind.RESOURCE);
+        restorePending.setVisible(paired);
+        restorePending.setEnabled(paired);
+        if (mappingBusy) {
+            lockCandidate.setEnabled(false);
+            unlockCandidate.setEnabled(false);
+            manualCandidate.setEnabled(false);
+            resolutionAction.setEnabled(false);
+            restorePending.setEnabled(false);
         }
     }
 
@@ -798,7 +1042,264 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void mappingChanged(WorkspaceController.Workspace updated) {
-        refresh(updated);
+        mappingBusy = false;
+        operationProgress.setVisible(false);
+        WorkspaceController.AnalysisUpdate update = controller.latestAnalysisUpdate();
+        FilterOption selectedFilter = (FilterOption) filter.getSelectedItem();
+        boolean unfiltered = search.getText().isBlank()
+                && (selectedFilter == null || selectedFilter.kind() == FilterKind.ALL);
+        if (update != null && update.workspace() == updated && !update.fullRefresh()
+                && update.affectedEntities().size() <= 1_000 && unfiltered && !treeNodeIndex.isEmpty()) {
+            applyIncrementalTreeUpdate(update);
+        } else {
+            refresh(updated);
+        }
+    }
+
+    private void applyIncrementalTreeUpdate(WorkspaceController.AnalysisUpdate update) {
+        long started = System.nanoTime();
+        List<TreeItem> previousItems = allItems;
+        workspace = update.workspace();
+        Set<EntityId> affected = update.affectedEntities();
+        List<TreeItem> oldItems = previousItems.stream().filter(item -> itemAffected(item, affected)).toList();
+        List<TreeItem> newItems = treeItemsForAffected(affected);
+        List<TreeItem> mergedItems = new ArrayList<>(previousItems.size() - oldItems.size() + newItems.size());
+        previousItems.stream().filter(item -> !itemAffected(item, affected)).forEach(mergedItems::add);
+        mergedItems.addAll(newItems);
+        allItems = List.copyOf(mergedItems);
+        DefaultTreeModel model = (DefaultTreeModel) tree.getModel();
+        DefaultMutableTreeNode root = (DefaultMutableTreeNode) model.getRoot();
+        String selectedKey = selected == null ? "" : stableNodeKey(selected);
+
+        for (TreeItem item : oldItems) {
+            DefaultMutableTreeNode node = treeNodeIndex.get(stableNodeKey(item.node()));
+            if (node != null && node.getParent() != null) removeIndexedNode(node, root, model);
+        }
+        for (TreeItem item : newItems) {
+            if (visible(item)) insertTreeItem(root, item, model);
+        }
+        updateTreeGroupLabels(model);
+        updateSummary();
+        restoreAffectedExpansion(newItems);
+        restoreSelection(selectedKey);
+        long treeMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        LOGGER.info("Incremental tree update: tree={}ms, affected={}, matching={}ms, diff={}ms",
+                treeMillis, affected.size(), update.timings().matchingMillis(), update.timings().diffMillis());
+    }
+
+    private boolean itemAffected(TreeItem item, Set<EntityId> affected) {
+        DiffNode node = item.node();
+        if (entityAffected(node.left(), affected) || entityAffected(node.right(), affected)) return true;
+        return item.members().stream().anyMatch(member -> entityAffected(member.left(), affected)
+                || entityAffected(member.right(), affected));
+    }
+
+    private List<TreeItem> treeItemsForAffected(Set<EntityId> affected) {
+        Map<String, TreeItemBuilder> classOwners = new HashMap<>();
+        List<TreeItemBuilder> classes = new ArrayList<>();
+        List<TreeItem> resources = new ArrayList<>();
+        for (DiffNode node : workspace.differences().nodes()) {
+            if (node.kind() == EntityKind.CLASS
+                    && (entityAffected(node.left(), affected) || entityAffected(node.right(), affected))) {
+                ClassClassification classification = node.left() != null && node.right() != null
+                        ? workspace.overrides().classifications().getOrDefault(
+                                new ClassPair(node.left(), node.right()), ClassClassification.AUTO)
+                        : ClassClassification.AUTO;
+                TreeItemBuilder builder = new TreeItemBuilder(node, classification);
+                classes.add(builder);
+                if (node.left() != null) classOwners.put("L:" + node.left().name(), builder);
+                if (node.right() != null) classOwners.put("R:" + node.right().name(), builder);
+            } else if (node.kind() == EntityKind.RESOURCE
+                    && (entityAffected(node.left(), affected) || entityAffected(node.right(), affected))) {
+                TreeStatus status = treeStatus(node);
+                resources.add(new TreeItem(node, List.of(), status, status, ClassClassification.AUTO));
+            }
+        }
+        if (!classOwners.isEmpty()) {
+            for (DiffNode node : workspace.differences().nodes()) {
+                if (node.kind() != EntityKind.FIELD && node.kind() != EntityKind.METHOD) continue;
+                TreeItemBuilder owner = node.left() == null ? null : classOwners.get("L:" + node.left().owner());
+                if (owner == null && node.right() != null) owner = classOwners.get("R:" + node.right().owner());
+                if (owner != null) owner.members.add(node);
+            }
+        }
+        List<TreeItem> result = new ArrayList<>(classes.size() + resources.size());
+        classes.stream().map(TreeItemBuilder::build).forEach(result::add);
+        result.addAll(resources);
+        return result;
+    }
+
+    private static boolean entityAffected(EntityId entity, Set<EntityId> affected) {
+        if (entity == null) return false;
+        if (affected.contains(entity)) return true;
+        if (entity.kind() == EntityKind.FIELD || entity.kind() == EntityKind.METHOD) {
+            return affected.contains(EntityId.classId(entity.owner()));
+        }
+        if (entity.kind() == EntityKind.CLASS) {
+            return affected.stream().anyMatch(id -> (id.kind() == EntityKind.FIELD || id.kind() == EntityKind.METHOD)
+                    && id.owner().equals(entity.name()));
+        }
+        return false;
+    }
+
+    private void insertTreeItem(DefaultMutableTreeNode root, TreeItem item, DefaultTreeModel model) {
+        DefaultMutableTreeNode temporaryRoot = new DefaultMutableTreeNode("root");
+        addStatusGroup(temporaryRoot, item.status(), List.of(item));
+        if (temporaryRoot.getChildCount() > 0) {
+            mergeTreeBranch(root, (DefaultMutableTreeNode) temporaryRoot.getChildAt(0), model);
+        }
+    }
+
+    private void mergeTreeBranch(
+            DefaultMutableTreeNode parent, DefaultMutableTreeNode desired, DefaultTreeModel model) {
+        String key = nodeKey(desired);
+        DefaultMutableTreeNode existing = treeNodeIndex.get(key);
+        if (existing == null || existing.getParent() != parent) {
+            int index = insertionIndex(parent, desired);
+            model.insertNodeInto(desired, parent, index);
+            indexSubtree(desired);
+            return;
+        }
+        existing.setUserObject(desired.getUserObject());
+        model.nodeChanged(existing);
+        List<DefaultMutableTreeNode> desiredChildren = new ArrayList<>();
+        for (int index = 0; index < desired.getChildCount(); index++) {
+            desiredChildren.add((DefaultMutableTreeNode) desired.getChildAt(index));
+        }
+        for (DefaultMutableTreeNode child : desiredChildren) mergeTreeBranch(existing, child, model);
+    }
+
+    private int insertionIndex(DefaultMutableTreeNode parent, DefaultMutableTreeNode desired) {
+        String desiredKey = nodeKey(desired);
+        if (parent.getParent() == null && desiredKey.startsWith("status:")) {
+            int desiredOrder = statusOrder(desiredKey);
+            for (int index = 0; index < parent.getChildCount(); index++) {
+                if (statusOrder(nodeKey((DefaultMutableTreeNode) parent.getChildAt(index))) > desiredOrder) return index;
+            }
+            return parent.getChildCount();
+        }
+        String desiredLabel = desired.toString();
+        for (int index = 0; index < parent.getChildCount(); index++) {
+            if (desiredLabel.compareToIgnoreCase(parent.getChildAt(index).toString()) < 0) return index;
+        }
+        return parent.getChildCount();
+    }
+
+    private static int statusOrder(String key) {
+        if (key.equals("status:changed")) return 0;
+        if (key.equals("status:unmatched")) return 1;
+        if (key.equals("status:unchanged")) return 2;
+        return 3;
+    }
+
+    private void removeIndexedNode(
+            DefaultMutableTreeNode node, DefaultMutableTreeNode root, DefaultTreeModel model) {
+        DefaultMutableTreeNode parent = (DefaultMutableTreeNode) node.getParent();
+        unindexSubtree(node);
+        model.removeNodeFromParent(node);
+        while (parent != null && parent != root && parent.getChildCount() == 0) {
+            DefaultMutableTreeNode empty = parent;
+            parent = (DefaultMutableTreeNode) empty.getParent();
+            unindexSubtree(empty);
+            model.removeNodeFromParent(empty);
+        }
+    }
+
+    private void updateTreeGroupLabels(DefaultTreeModel model) {
+        Map<TreeStatus, Long> counts = new EnumMap<>(TreeStatus.class);
+        for (TreeStatus status : TreeStatus.values()) counts.put(status, 0L);
+        allItems.forEach(item -> counts.compute(item.status(), (ignored, value) -> value + 1));
+        for (TreeStatus status : TreeStatus.values()) {
+            DefaultMutableTreeNode node = treeNodeIndex.get("status:" + status.key());
+            if (node != null && node.getUserObject() instanceof TreeEntry entry) {
+                node.setUserObject(new TreeEntry(entry.stableKey(),
+                        text(status.messageKey()) + " (" + counts.get(status) + ')', null));
+                model.nodeChanged(node);
+            }
+        }
+        for (TreeSide side : TreeSide.values()) {
+            DefaultMutableTreeNode node = treeNodeIndex.get("status:unmatched:" + side.key);
+            if (node != null && node.getUserObject() instanceof TreeEntry entry) {
+                long count = allItems.stream().filter(item -> item.status() == TreeStatus.UNMATCHED)
+                        .filter(item -> side.matches(item.node())).count();
+                node.setUserObject(new TreeEntry(entry.stableKey(), text(side.messageKey) + " (" + count + ')', null));
+                model.nodeChanged(node);
+            }
+        }
+    }
+
+    private void updateSummary() {
+        long confirmedClasses = workspace.matches().confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .count();
+        long pendingClasses = workspace.matches().candidates().keySet().stream()
+                .filter(entity -> entity.kind() == EntityKind.CLASS)
+                .count();
+        long changedClasses = allItems.stream()
+                .filter(item -> item.node().kind() == EntityKind.CLASS)
+                .filter(item -> item.status() == TreeStatus.CHANGED)
+                .count();
+        summary.update(workspace.left().classes().size(), workspace.right().classes().size(),
+                confirmedClasses, pendingClasses, changedClasses);
+    }
+
+    private void restoreAffectedExpansion(List<TreeItem> items) {
+        for (TreeItem item : items) {
+            DefaultMutableTreeNode node = treeNodeIndex.get(stableNodeKey(item.node()));
+            if (node == null) continue;
+            TreePath path = new TreePath(node.getPath());
+            for (Object component : path.getPath()) {
+                if (component instanceof DefaultMutableTreeNode treeNode
+                        && expandedTreeKeys.contains(nodeKey(treeNode))) {
+                    tree.expandPath(new TreePath(treeNode.getPath()));
+                }
+            }
+        }
+    }
+
+    private void restoreSelection(String key) {
+        if (key.isBlank()) return;
+        DefaultMutableTreeNode node = treeNodeIndex.get(key);
+        if (node != null) tree.setSelectionPath(new TreePath(node.getPath()));
+    }
+
+    private void rebuildTreeIndex(DefaultMutableTreeNode root) {
+        treeNodeIndex.clear();
+        indexSubtree(root);
+    }
+
+    private void indexSubtree(DefaultMutableTreeNode node) {
+        String key = nodeKey(node);
+        if (!key.isBlank()) treeNodeIndex.put(key, node);
+        for (int index = 0; index < node.getChildCount(); index++) {
+            indexSubtree((DefaultMutableTreeNode) node.getChildAt(index));
+        }
+    }
+
+    private void unindexSubtree(DefaultMutableTreeNode node) {
+        treeNodeIndex.remove(nodeKey(node));
+        for (int index = 0; index < node.getChildCount(); index++) {
+            unindexSubtree((DefaultMutableTreeNode) node.getChildAt(index));
+        }
+    }
+
+    private static String nodeKey(DefaultMutableTreeNode node) {
+        return node.getUserObject() instanceof TreeEntry entry ? entry.stableKey() : "";
+    }
+
+    private DiffNode mappingNode(DiffNode node) {
+        if (node == null || node.kind() == EntityKind.CLASS || node.kind() == EntityKind.RESOURCE) {
+            return node;
+        }
+        EntityId id = node.left() != null ? node.left() : node.right();
+        boolean left = node.left() != null;
+        return workspace.differences().nodes().stream()
+                .filter(candidate -> candidate.kind() == EntityKind.CLASS)
+                .filter(candidate -> {
+                    EntityId classId = left ? candidate.left() : candidate.right();
+                    return classId != null && classId.name().equals(id.owner());
+                })
+                .findFirst().orElse(null);
     }
 
     private String overview(DiffNode node) {
@@ -931,12 +1432,26 @@ public final class WorkspacePanel extends JPanel {
             if (key.equals("root:classes")) {
                 for (TreeStatus status : TreeStatus.values()) {
                     migrated.add("status:" + status.key());
-                    migrated.add("status:" + status.key() + ":classes");
+                    if (status == TreeStatus.UNMATCHED) {
+                        migrated.add("status:unmatched:old");
+                        migrated.add("status:unmatched:old:classes");
+                        migrated.add("status:unmatched:new");
+                        migrated.add("status:unmatched:new:classes");
+                    } else {
+                        migrated.add("status:" + status.key() + ":classes");
+                    }
                 }
             } else if (key.equals("root:resources")) {
                 for (TreeStatus status : TreeStatus.values()) {
                     migrated.add("status:" + status.key());
-                    migrated.add("status:" + status.key() + ":resources");
+                    if (status == TreeStatus.UNMATCHED) {
+                        migrated.add("status:unmatched:old");
+                        migrated.add("status:unmatched:old:resources");
+                        migrated.add("status:unmatched:new");
+                        migrated.add("status:unmatched:new:resources");
+                    } else {
+                        migrated.add("status:" + status.key() + ":resources");
+                    }
                 }
             } else if (key.startsWith("package:classes:")) {
                 String path = key.substring("package:classes:".length());
@@ -959,21 +1474,22 @@ public final class WorkspacePanel extends JPanel {
             return "owner:*:R:" + stableKey.substring("entity:R:CLASS:".length());
         }
         if (stableKey.startsWith("package:")) {
-            String[] parts = stableKey.split(":", 4);
-            if (parts.length == 4 && isStatusKey(parts[1])) {
-                return "package:*:" + parts[2] + ':' + parts[3];
-            }
+            String value = stableKey.substring("package:".length());
+            int classes = value.indexOf(":classes:");
+            if (classes >= 0) return "package:*:classes:" + value.substring(classes + ":classes:".length());
+            int resources = value.indexOf(":resources:");
+            if (resources >= 0) return "package:*:resources:" + value.substring(resources + ":resources:".length());
         }
         if (stableKey.startsWith("owner:")) {
             String[] parts = stableKey.split(":", 4);
             if (parts.length == 4 && isStatusKey(parts[1])) {
-                return "member-owner:*:" + parts[2] + ':' + parts[3];
+                return "owner:*:" + parts[2] + ':' + parts[3];
             }
         }
         if (stableKey.startsWith("member-owner:")) {
             String[] parts = stableKey.split(":", 4);
             if (parts.length == 4 && isStatusKey(parts[1])) {
-                return "member-owner:*:" + parts[2] + ':' + parts[3];
+                return "owner:*:" + parts[2] + ':' + parts[3];
             }
         }
         return stableKey;
@@ -1023,6 +1539,25 @@ public final class WorkspacePanel extends JPanel {
         return summary.getComponentCount();
     }
 
+    List<Long> summaryValuesForTesting() {
+        return summary.values();
+    }
+
+    EntityId mappingSubjectForTesting(DiffNode node) {
+        DiffNode subject = mappingNode(node);
+        return subject == null ? null : subject.left() != null ? subject.left() : subject.right();
+    }
+
+    boolean mappingBusyForTesting() {
+        return mappingBusy && operationProgress.isVisible();
+    }
+
+    void expandEntityForTesting(String stableKey) {
+        DefaultMutableTreeNode root = (DefaultMutableTreeNode) tree.getModel().getRoot();
+        TreePath path = findTreePath(root, stableKey);
+        if (path != null) tree.expandPath(path);
+    }
+
     void selectForTesting(DiffNode node) {
         selected = node;
         updateCandidates(node);
@@ -1042,6 +1577,29 @@ public final class WorkspacePanel extends JPanel {
         List<String> keys = new ArrayList<>();
         collectStableKeys((DefaultMutableTreeNode) tree.getModel().getRoot(), keys);
         return keys;
+    }
+
+    String treeLabelForKeyForTesting(String key) {
+        DefaultMutableTreeNode root = (DefaultMutableTreeNode) tree.getModel().getRoot();
+        TreePath path = findTreePath(root, key);
+        if (path == null) return null;
+        Object value = ((DefaultMutableTreeNode) path.getLastPathComponent()).getUserObject();
+        return value instanceof TreeEntry entry ? entry.label() : String.valueOf(value);
+    }
+
+    String treeTooltipForKeyForTesting(String key) {
+        DefaultMutableTreeNode node = treeNodeIndex.get(key);
+        if (node == null) return null;
+        TreePath path = new TreePath(node.getPath());
+        int row = tree.getRowForPath(path);
+        Component component = tree.getCellRenderer().getTreeCellRendererComponent(
+                tree, node, false, tree.isExpanded(path), node.isLeaf(), row, false);
+        return component instanceof javax.swing.JComponent swingComponent
+                ? swingComponent.getToolTipText() : null;
+    }
+
+    void applyAnalysisUpdateForTesting(WorkspaceController.AnalysisUpdate update) {
+        applyIncrementalTreeUpdate(update);
     }
 
     private static void collectStableKeys(DefaultMutableTreeNode node, List<String> target) {
@@ -1074,7 +1632,80 @@ public final class WorkspacePanel extends JPanel {
         @Override public String toString() { return label; }
     }
 
-    private record TreeEntry(String stableKey, String label, DiffNode node) {
+    private record TreeItem(
+            DiffNode node,
+            List<DiffNode> members,
+            TreeStatus automaticStatus,
+            TreeStatus status,
+            ClassClassification classification) {
+        TreeItem {
+            members = List.copyOf(members);
+        }
+    }
+
+    private static final class TreeItemBuilder {
+        private final DiffNode node;
+        private final ClassClassification classification;
+        private final List<DiffNode> members = new ArrayList<>();
+
+        TreeItemBuilder(DiffNode node, ClassClassification classification) {
+            this.node = node;
+            this.classification = classification;
+        }
+
+        TreeItem build() {
+            members.sort(Comparator.comparing(DiffNode::displayName));
+            TreeStatus status = treeStatus(node);
+            if (status == TreeStatus.UNMATCHED && node.left() != null && node.right() != null) {
+                status = TreeStatus.CHANGED;
+            }
+            TreeStatus automaticStatus = status;
+            if (node.left() != null && node.right() != null) {
+                if (classification == ClassClassification.FORCE_CHANGED) status = TreeStatus.CHANGED;
+                if (classification == ClassClassification.FORCE_UNCHANGED) status = TreeStatus.UNCHANGED;
+            }
+            return new TreeItem(node, members, automaticStatus, status, classification);
+        }
+    }
+
+    private enum TreeSide {
+        OLD("old", "tree.oldVersion") {
+            @Override boolean matches(DiffNode node) { return node.left() != null && node.right() == null; }
+        },
+        NEW("new", "tree.newVersion") {
+            @Override boolean matches(DiffNode node) { return node.left() == null && node.right() != null; }
+        };
+
+        private final String key;
+        private final String messageKey;
+
+        TreeSide(String key, String messageKey) {
+            this.key = key;
+            this.messageKey = messageKey;
+        }
+
+        abstract boolean matches(DiffNode node);
+    }
+
+    private record TreeEntry(
+            String stableKey,
+            String label,
+            DiffNode node,
+            List<DiffNode> members,
+            ClassClassification classification) {
+        TreeEntry {
+            members = members == null ? List.of() : List.copyOf(members);
+            classification = classification == null ? ClassClassification.AUTO : classification;
+        }
+
+        TreeEntry(String stableKey, String label, DiffNode node) {
+            this(stableKey, label, node, List.of(), ClassClassification.AUTO);
+        }
+
+        TreeEntry(String stableKey, String label, DiffNode node, List<DiffNode> members) {
+            this(stableKey, label, node, members, ClassClassification.AUTO);
+        }
+
         @Override public String toString() { return label; }
     }
 
@@ -1102,6 +1733,10 @@ public final class WorkspacePanel extends JPanel {
             pending.setValue(pendingCount);
             changed.setValue(changedCount);
         }
+
+        List<Long> values() {
+            return List.of(oldClasses.value(), newClasses.value(), confirmed.value(), pending.value(), changed.value());
+        }
     }
 
     private static final class MetricCard extends JPanel {
@@ -1125,6 +1760,10 @@ public final class WorkspacePanel extends JPanel {
         void setValue(long number) {
             value.setText(Long.toString(number));
         }
+
+        long value() {
+            return Long.parseLong(value.getText());
+        }
     }
 
     private static final class DiffTreeRenderer extends DefaultTreeCellRenderer {
@@ -1139,12 +1778,16 @@ public final class WorkspacePanel extends JPanel {
                 boolean focused) {
             Component component = super.getTreeCellRendererComponent(
                     tree, value, selected, expanded, leaf, row, focused);
+            setToolTipText(null);
+            if (value instanceof DefaultMutableTreeNode treeNode
+                    && treeNode.getUserObject() instanceof TreeEntry entry
+                    && entry.classification() != ClassClassification.AUTO) {
+                setIcon(new PinCompositeIcon(getIcon(), contrastingPinColor(getForeground(), getBackground())));
+                setToolTipText(text(entry.classification() == ClassClassification.FORCE_CHANGED
+                        ? "tree.manualClassificationChanged" : "tree.manualClassificationUnchanged"));
+            }
             if (!selected && value instanceof DefaultMutableTreeNode treeNode
                     && treeNode.getUserObject() instanceof TreeEntry entry) {
-                if (entry.stableKey().startsWith("member-owner:")) {
-                    setForeground(UIManager.getColor("Label.disabledForeground"));
-                    return component;
-                }
                 if (entry.node() == null) {
                     return component;
                 }
@@ -1159,6 +1802,60 @@ public final class WorkspacePanel extends JPanel {
                 }
             }
             return component;
+        }
+
+        private static Color contrastingPinColor(Color foreground, Color background) {
+            if (foreground != null && (background == null
+                    || Math.abs(foreground.getRed() - background.getRed())
+                    + Math.abs(foreground.getGreen() - background.getGreen())
+                    + Math.abs(foreground.getBlue() - background.getBlue()) >= 180)) {
+                return foreground;
+            }
+            if (background == null) return Color.BLACK;
+            double luminance = background.getRed() * 0.2126
+                    + background.getGreen() * 0.7152 + background.getBlue() * 0.0722;
+            return luminance >= 128 ? Color.BLACK : Color.WHITE;
+        }
+    }
+
+    private static final class PinCompositeIcon implements Icon {
+        private static final int GAP = 3;
+        private static final int PIN_WIDTH = 9;
+        private final Icon base;
+        private final Color color;
+
+        PinCompositeIcon(Icon base, Color color) {
+            this.base = base;
+            this.color = color;
+        }
+
+        @Override public int getIconWidth() {
+            return (base == null ? 0 : base.getIconWidth()) + GAP + PIN_WIDTH;
+        }
+
+        @Override public int getIconHeight() {
+            return Math.max(base == null ? 0 : base.getIconHeight(), 12);
+        }
+
+        @Override
+        public void paintIcon(Component component, Graphics graphics, int x, int y) {
+            if (base != null) {
+                base.paintIcon(component, graphics, x, y + (getIconHeight() - base.getIconHeight()) / 2);
+            }
+            int pinX = x + (base == null ? 0 : base.getIconWidth()) + GAP;
+            Graphics2D copy = (Graphics2D) graphics.create();
+            try {
+                copy.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                copy.setColor(color);
+                int centerY = y + getIconHeight() / 2;
+                copy.translate(pinX + 4, centerY);
+                copy.rotate(Math.PI / 4.0);
+                copy.fillOval(-2, -4, 4, 4);
+                copy.fillRect(-3, -1, 6, 2);
+                copy.drawLine(0, 1, 0, 5);
+            } finally {
+                copy.dispose();
+            }
         }
     }
 
@@ -1209,7 +1906,7 @@ public final class WorkspacePanel extends JPanel {
             return switch (status) {
                 case EXACT -> text("candidate.status.exact");
                 case AUTO_CONFIRMED -> text("candidate.status.auto");
-                case MANUAL_LOCKED -> text("candidate.status.locked");
+                case MANUAL_CONFIRMED -> text("candidate.status.locked");
                 case SUGGESTED -> text("candidate.status.suggested");
             };
         }

@@ -6,6 +6,9 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Set;
 import org.earthsworth.wmatcher.core.model.EntityId;
+import org.earthsworth.wmatcher.core.model.DetachedPair;
+import org.earthsworth.wmatcher.core.model.ClassClassification;
+import org.earthsworth.wmatcher.core.model.ClassPair;
 import org.earthsworth.wmatcher.core.project.ArtifactReference;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.earthsworth.wmatcher.core.project.WMatcherProject;
@@ -25,6 +28,9 @@ class JacksonProjectRepositoryTest {
                 Map.of(EntityId.classId("old/A"), EntityId.classId("new/B")),
                 Set.of(EntityId.resourceId("removed.txt")),
                 Set.of(EntityId.resourceId("added.txt")),
+                Set.of(new DetachedPair(EntityId.classId("old/Detached"), EntityId.classId("new/Detached"))),
+                Map.of(new ClassPair(EntityId.classId("old/A"), EntityId.classId("new/B")),
+                        ClassClassification.FORCE_UNCHANGED),
                 new ProjectUiState("needle", Set.of("CHANGED"), "entity:L:CLASS:old/A",
                         Set.of("root:classes", "package:classes:old"), 120, 285));
         Path path = temporaryDirectory.resolve("sample.wmatch");
@@ -58,10 +64,12 @@ class JacksonProjectRepositoryTest {
         assertThat(restored.uiState().search()).isEqualTo("legacy");
         assertThat(restored.uiState().expandedTreeKeys()).contains(
                 "status:changed", "status:changed:classes",
-                "status:unmatched", "status:unmatched:classes");
+                "status:unmatched", "status:unmatched:old", "status:unmatched:new");
         assertThat(restored.uiState().navigationDividerLocation()).isEqualTo(340);
         assertThat(restored.confirmedRemoved()).isEmpty();
         assertThat(restored.confirmedAdded()).isEmpty();
+        assertThat(restored.detachedPairs()).isEmpty();
+        assertThat(restored.classifications()).isEmpty();
     }
 
     @Test

@@ -13,11 +13,15 @@ import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.FieldModel;
 import org.earthsworth.wmatcher.core.model.MappingOverrides;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
+import org.earthsworth.wmatcher.core.model.MatchResult;
 import org.earthsworth.wmatcher.core.model.MatchingPolicy;
 import org.earthsworth.wmatcher.core.model.MethodModel;
+import org.earthsworth.wmatcher.core.model.ResourceModel;
+import org.earthsworth.wmatcher.core.model.DetachedPair;
 import org.earthsworth.wmatcher.core.model.ScanOptions;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
 import org.earthsworth.wmatcher.core.task.ProgressListener;
+import org.earthsworth.wmatcher.core.service.MatchingSession;
 import org.earthsworth.wmatcher.engine.jar.JarArtifactLoader;
 import org.earthsworth.wmatcher.engine.support.TestArtifacts;
 import org.junit.jupiter.api.Test;
@@ -156,6 +160,103 @@ class DefaultMatchingEngineTest {
 
         assertThat(result.confirmedMappings()).doesNotContainKey(leftClass.id());
         assertThat(result.rankedCandidates().getOrDefault(leftClass.id(), List.of())).isEmpty();
+    }
+
+    @Test
+    void detachedClassPairRemainsUnmatchedButKeepsItsCandidate() {
+        ClassModel leftClass = classModel("old/Source", List.of(), List.of(), "same-structure", "same-code");
+        ClassModel rightClass = classModel("new/Target", List.of(), List.of(), "same-structure", "same-code");
+        ArtifactSnapshot left = snapshot("detached-left", Map.of(leftClass.internalName(), leftClass));
+        ArtifactSnapshot right = snapshot("detached-right", Map.of(rightClass.internalName(), rightClass));
+        ComparisonOverrides overrides = new ComparisonOverrides(Map.of(), Set.of(), Set.of(),
+                Set.of(new DetachedPair(leftClass.id(), rightClass.id())));
+
+        var result = new DefaultMatchingEngine().match(left, right, overrides,
+                MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(result.confirmedMappings()).doesNotContainKey(leftClass.id());
+        assertThat(result.candidates().get(leftClass.id()))
+                .extracting(match -> match.right())
+                .contains(rightClass.id());
+        assertThat(result.unmatchedLeft()).contains(leftClass.id());
+        assertThat(result.unmatchedRight()).contains(rightClass.id());
+    }
+
+    @Test
+    void resourceOnlyOverrideUsesIncrementalRematchWithoutChangingEntityMatches() {
+        ResourceModel resource = new ResourceModel("added.txt", 1, "hash", true);
+        ArtifactSnapshot left = snapshot("resource-left", Map.of());
+        ArtifactSnapshot right = new ArtifactSnapshot(Path.of("resource-right.jar"), "right", 0, 0, 1, 21,
+                Map.of(), Map.of(), Map.of(resource.path(), resource));
+        DefaultMatchingEngine engine = new DefaultMatchingEngine();
+        MatchResult previous = engine.match(left, right, ComparisonOverrides.EMPTY,
+                MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+        ComparisonOverrides updated = new ComparisonOverrides(Map.of(), Set.of(), Set.of(resource.id()));
+
+        MatchResult rematched = engine.rematch(left, right, previous, ComparisonOverrides.EMPTY, updated,
+                Set.of(resource.id()), MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(rematched).isSameAs(previous);
+    }
+
+    @Test
+    void sessionReusesCandidateGraphAndHonorsItsCacheBudget() {
+        ClassModel oldClass = classModel("old/Owner", List.of(), List.of(), "same-structure", "same-code");
+        ClassModel newClass = classModel("new/Owner", List.of(), List.of(), "same-structure", "same-code");
+        ArtifactSnapshot left = snapshot("session-left", Map.of(oldClass.internalName(), oldClass));
+        ArtifactSnapshot right = snapshot("session-right", Map.of(newClass.internalName(), newClass));
+        DefaultMatchingEngine engine = new DefaultMatchingEngine();
+        MatchingSession session = engine.openSession(left, right, MatchingPolicy.conservativeV1(),
+                ProgressListener.NONE, CancellationToken.NONE);
+        MatchResult initial = session.match(ComparisonOverrides.EMPTY, ProgressListener.NONE, CancellationToken.NONE);
+        ComparisonOverrides detached = new ComparisonOverrides(Map.of(), Set.of(), Set.of(),
+                Set.of(new DetachedPair(oldClass.id(), newClass.id())));
+
+        MatchResult updated = session.rematch(initial, ComparisonOverrides.EMPTY, detached,
+                Set.of(oldClass.id(), newClass.id()), ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(updated.confirmedMappings()).doesNotContainEntry(oldClass.id(), newClass.id());
+        assertThat(updated.rankedCandidates().get(oldClass.id()))
+                .extracting(match -> match.right()).contains(newClass.id());
+        assertThat(session.maximumCacheWeight()).isEqualTo(512L * 1024 * 1024);
+        assertThat(session.currentCacheWeight()).isLessThanOrEqualTo(session.maximumCacheWeight());
+        session.close();
+        assertThat(session.currentCacheWeight()).isZero();
+    }
+
+    @Test
+    void deterministicallyPairsEquivalentMembersInsideSemanticallyUnchangedClasses() {
+        FieldModel oldA = field("a", "I", "same-field");
+        FieldModel oldB = field("b", "I", "same-field");
+        FieldModel newX = field("x", "I", "same-field");
+        FieldModel newY = field("y", "I", "same-field");
+        MethodModel oldM1 = method("a", "same-code", "same-method");
+        MethodModel oldM2 = method("b", "same-code", "same-method");
+        MethodModel newM1 = method("x", "same-code", "same-method");
+        MethodModel newM2 = method("y", "same-code", "same-method");
+        ClassModel oldClass = classModel("old/Owner", List.of(oldB, oldA), List.of(oldM2, oldM1),
+                "same-class", "same-bytecode");
+        ClassModel newClass = classModel("new/Owner", List.of(newX, newY), List.of(newM1, newM2),
+                "same-class", "same-bytecode");
+        DefaultMatchingEngine engine = new DefaultMatchingEngine();
+
+        MatchResult result = engine.match(
+                snapshot("equivalent-left", Map.of(oldClass.internalName(), oldClass)),
+                snapshot("equivalent-right", Map.of(newClass.internalName(), newClass)),
+                ComparisonOverrides.EMPTY, MatchingPolicy.conservativeV1(),
+                ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(result.confirmedMappings())
+                .containsEntry(EntityId.fieldId("old/Owner", "a", "I"),
+                        EntityId.fieldId("new/Owner", "x", "I"))
+                .containsEntry(EntityId.fieldId("old/Owner", "b", "I"),
+                        EntityId.fieldId("new/Owner", "y", "I"))
+                .containsEntry(EntityId.methodId("old/Owner", "a", "()I"),
+                        EntityId.methodId("new/Owner", "x", "()I"))
+                .containsEntry(EntityId.methodId("old/Owner", "b", "()I"),
+                        EntityId.methodId("new/Owner", "y", "()I"));
+        assertThat(result.candidates()).doesNotContainKeys(
+                EntityId.fieldId("old/Owner", "a", "I"), EntityId.methodId("old/Owner", "a", "()I"));
     }
 
     private static ArtifactSnapshot snapshot(String name, Map<String, ClassModel> classes) {

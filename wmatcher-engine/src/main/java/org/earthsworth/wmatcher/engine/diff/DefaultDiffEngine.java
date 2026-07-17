@@ -17,6 +17,7 @@ import org.earthsworth.wmatcher.core.model.ClassModel;
 import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.DiffResult;
+import org.earthsworth.wmatcher.core.model.DetachedPair;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.FieldModel;
@@ -26,10 +27,147 @@ import org.earthsworth.wmatcher.core.model.MethodModel;
 import org.earthsworth.wmatcher.core.model.ResourceModel;
 import org.earthsworth.wmatcher.core.model.ResolutionStatus;
 import org.earthsworth.wmatcher.core.service.DiffEngine;
+import org.earthsworth.wmatcher.core.service.DiffSession;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
 import org.earthsworth.wmatcher.core.task.ProgressListener;
 
 public final class DefaultDiffEngine implements DiffEngine {
+    @Override
+    public DiffSession openSession(ArtifactSnapshot left, ArtifactSnapshot right) {
+        return new DiffSession() {
+            private boolean closed;
+
+            @Override
+            public DiffResult diff(
+                    MatchResult matches,
+                    ComparisonOverrides overrides,
+                    ProgressListener progress,
+                    CancellationToken cancellation) {
+                ensureOpen();
+                return DefaultDiffEngine.this.diff(left, right, matches, overrides, progress, cancellation);
+            }
+
+            @Override
+            public DiffResult rediff(
+                    MatchResult matches,
+                    DiffResult previous,
+                    ComparisonOverrides overrides,
+                    Set<EntityId> affectedEntities,
+                    ProgressListener progress,
+                    CancellationToken cancellation) {
+                ensureOpen();
+                return DefaultDiffEngine.this.rediff(
+                        left, right, matches, previous, overrides, affectedEntities, progress, cancellation);
+            }
+
+            @Override public void close() { closed = true; }
+
+            private void ensureOpen() {
+                if (closed) throw new IllegalStateException("Diff session is closed");
+            }
+        };
+    }
+
+    @Override
+    public DiffResult rediff(
+            ArtifactSnapshot left,
+            ArtifactSnapshot right,
+            MatchResult matches,
+            DiffResult previous,
+            ComparisonOverrides overrides,
+            Set<EntityId> affectedEntities,
+            ProgressListener progress,
+            CancellationToken cancellation) {
+        if (affectedEntities.isEmpty()) return previous;
+        boolean resourcesAffected = affectedEntities.stream().anyMatch(id -> id.kind() == EntityKind.RESOURCE);
+        Set<String> affectedLeftClasses = affectedEntities.stream()
+                .filter(id -> id.kind() != EntityKind.RESOURCE)
+                .map(id -> id.kind() == EntityKind.CLASS ? id.name() : id.owner())
+                .filter(left.classes()::containsKey)
+                .collect(Collectors.toCollection(HashSet::new));
+        Set<String> affectedRightClasses = affectedEntities.stream()
+                .filter(id -> id.kind() != EntityKind.RESOURCE)
+                .map(id -> id.kind() == EntityKind.CLASS ? id.name() : id.owner())
+                .filter(right.classes()::containsKey)
+                .collect(Collectors.toCollection(HashSet::new));
+        matches.confirmed().stream().filter(match -> match.left().kind() == EntityKind.CLASS).forEach(match -> {
+            if (affectedLeftClasses.contains(match.left().name())
+                    || affectedRightClasses.contains(match.right().name())) {
+                affectedLeftClasses.add(match.left().name());
+                affectedRightClasses.add(match.right().name());
+            }
+        });
+
+        List<DiffNode> nodes = previous.nodes().stream()
+                .filter(node -> !resourcesAffected || node.kind() != EntityKind.RESOURCE)
+                .filter(node -> node.kind() == EntityKind.RESOURCE
+                        || !touchesClasses(node, affectedLeftClasses, affectedRightClasses))
+                .collect(Collectors.toCollection(ArrayList::new));
+
+        Map<String, String> matchedClasses = matches.confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.CLASS)
+                .collect(Collectors.toMap(match -> match.left().name(), match -> match.right().name()));
+        Set<EntityId> matchedLeft = matches.confirmed().stream().map(MatchDecision::left).collect(Collectors.toSet());
+        Set<EntityId> matchedRight = matches.confirmed().stream().map(MatchDecision::right).collect(Collectors.toSet());
+        Set<EntityId> candidateLeft = matches.candidates().keySet();
+        Set<EntityId> candidateRight = matches.candidates().values().stream()
+                .flatMap(List::stream).map(MatchDecision::right).collect(Collectors.toSet());
+
+        for (MatchDecision match : matches.confirmed()) {
+            if (!touchesClasses(match, affectedLeftClasses, affectedRightClasses)) continue;
+            cancellation.throwIfCancelled();
+            DiffNode node = switch (match.left().kind()) {
+                case CLASS -> classNode(left, right, match);
+                case FIELD -> fieldNode(left, right, match);
+                case METHOD -> methodNode(left, right, match);
+                case RESOURCE -> null;
+            };
+            if (node != null) nodes.add(node);
+        }
+        left.classes().values().stream()
+                .filter(model -> affectedLeftClasses.contains(model.internalName()))
+                .filter(model -> !matchedLeft.contains(model.id()))
+                .forEach(model -> nodes.add(new DiffNode("class:L:" + model.internalName(), model.internalName(),
+                        EntityKind.CLASS, model.id(), null,
+                        Set.of(candidateLeft.contains(model.id()) ? ChangeKind.UNRESOLVED : ChangeKind.REMOVED),
+                        resolution(model.id(), true, overrides))));
+        right.classes().values().stream()
+                .filter(model -> affectedRightClasses.contains(model.internalName()))
+                .filter(model -> !matchedRight.contains(model.id()))
+                .forEach(model -> nodes.add(new DiffNode("class:R:" + model.internalName(), model.internalName(),
+                        EntityKind.CLASS, null, model.id(),
+                        Set.of(candidateRight.contains(model.id()) ? ChangeKind.UNRESOLVED : ChangeKind.ADDED),
+                        resolution(model.id(), false, overrides))));
+
+        List<DiffNode> members = new ArrayList<>();
+        addUnmatchedMembers(left, matches.unmatchedLeft(), matchedClasses.keySet(), candidateLeft, true,
+                overrides, members);
+        addUnmatchedMembers(right, matches.unmatchedRight(), new HashSet<>(matchedClasses.values()), candidateRight,
+                false, overrides, members);
+        members.stream().filter(node -> touchesClasses(node, affectedLeftClasses, affectedRightClasses))
+                .forEach(nodes::add);
+        if (resourcesAffected) addResourceNodes(left.resources(), right.resources(), overrides, nodes, cancellation);
+        nodes.sort(Comparator.comparing(DiffNode::kind).thenComparing(DiffNode::displayName));
+        return result(nodes);
+    }
+
+    private static boolean touchesClasses(
+            DiffNode node, Set<String> leftClasses, Set<String> rightClasses) {
+        return className(node.left()) != null && leftClasses.contains(className(node.left()))
+                || className(node.right()) != null && rightClasses.contains(className(node.right()));
+    }
+
+    private static boolean touchesClasses(
+            MatchDecision match, Set<String> leftClasses, Set<String> rightClasses) {
+        return className(match.left()) != null && leftClasses.contains(className(match.left()))
+                || className(match.right()) != null && rightClasses.contains(className(match.right()));
+    }
+
+    private static String className(EntityId id) {
+        if (id == null || id.kind() == EntityKind.RESOURCE) return null;
+        return id.kind() == EntityKind.CLASS ? id.name() : id.owner();
+    }
+
     @Override
     public DiffResult diff(
             ArtifactSnapshot left,
@@ -87,10 +225,12 @@ public final class DefaultDiffEngine implements DiffEngine {
         addResourceNodes(left.resources(), right.resources(), overrides, nodes, cancellation);
 
         nodes.sort(Comparator.comparing(DiffNode::kind).thenComparing(DiffNode::displayName));
+        return result(nodes);
+    }
+
+    private static DiffResult result(List<DiffNode> nodes) {
         Map<ChangeKind, Long> counts = new EnumMap<>(ChangeKind.class);
-        for (DiffNode node : nodes) {
-            node.changes().forEach(change -> counts.merge(change, 1L, Long::sum));
-        }
+        for (DiffNode node : nodes) node.changes().forEach(change -> counts.merge(change, 1L, Long::sum));
         return new DiffResult(nodes, counts);
     }
 
@@ -179,6 +319,14 @@ public final class DefaultDiffEngine implements DiffEngine {
             CancellationToken cancellation) {
         Set<String> common = new HashSet<>(left.keySet());
         common.retainAll(right.keySet());
+        Set<EntityId> detachedLeft = overrides.detachedPairs().stream()
+                .filter(pair -> pair.left().kind() == EntityKind.RESOURCE)
+                .map(DetachedPair::left).collect(Collectors.toSet());
+        Set<EntityId> detachedRight = overrides.detachedPairs().stream()
+                .filter(pair -> pair.right().kind() == EntityKind.RESOURCE)
+                .map(DetachedPair::right).collect(Collectors.toSet());
+        common.removeIf(path -> detachedLeft.contains(left.get(path).id())
+                || detachedRight.contains(right.get(path).id()));
         for (String path : common) {
             cancellation.throwIfCancelled();
             ResourceModel leftResource = left.get(path);
@@ -200,6 +348,9 @@ public final class DefaultDiffEngine implements DiffEngine {
             if (entry.getValue().size() == 1 && rightMatches.size() == 1) {
                 ResourceModel leftResource = entry.getValue().getFirst();
                 ResourceModel rightResource = rightMatches.getFirst();
+                if (detachedLeft.contains(leftResource.id()) || detachedRight.contains(rightResource.id())) {
+                    continue;
+                }
                 movedLeft.add(leftResource.path());
                 movedRight.add(rightResource.path());
                 nodes.add(new DiffNode("resource:" + leftResource.path(),

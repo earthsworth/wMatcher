@@ -4,5 +4,5 @@ public enum MatchStatus {
     EXACT,
     AUTO_CONFIRMED,
     SUGGESTED,
-    MANUAL_LOCKED
+    MANUAL_CONFIRMED
 }

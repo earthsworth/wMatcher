@@ -6,10 +6,14 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import javax.swing.SwingUtilities;
+import javax.swing.JTree;
 import javax.swing.tree.TreePath;
 import org.earthsworth.wmatcher.app.WorkspaceController;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ChangeKind;
+import org.earthsworth.wmatcher.core.model.ClassClassification;
+import org.earthsworth.wmatcher.core.model.ClassPair;
+import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.DiffResult;
 import org.earthsworth.wmatcher.core.model.EntityId;
@@ -39,6 +43,41 @@ class WorkspacePanelTest {
         assertThat(result.panel).isNotNull();
         assertThat(result.panel.getComponentCount()).isGreaterThan(0);
         assertThat(result.panel.summaryCardCountForTesting()).isEqualTo(5);
+        controller.close();
+    }
+
+    @Test
+    void summaryCountsOnlyClassLevelMatchesCandidatesAndChanges() throws Exception {
+        EntityId oldClass = EntityId.classId("old/Owner");
+        EntityId newClass = EntityId.classId("new/Owner");
+        ScoreBreakdown score = new ScoreBreakdown(1.0, Map.of("fingerprint", 1.0));
+        List<MatchDecision> confirmed = new java.util.ArrayList<>();
+        confirmed.add(new MatchDecision(oldClass, newClass, MatchStatus.EXACT, score));
+        Map<EntityId, List<MatchDecision>> memberCandidates = new java.util.LinkedHashMap<>();
+        for (int index = 0; index < 8; index++) {
+            EntityId oldMethod = EntityId.methodId("old/Owner", "m" + index, "()V");
+            EntityId newMethod = EntityId.methodId("new/Owner", "x" + index, "()V");
+            confirmed.add(new MatchDecision(oldMethod, newMethod, MatchStatus.EXACT, score));
+            EntityId pendingMethod = EntityId.methodId("old/Owner", "p" + index, "()V");
+            memberCandidates.put(pendingMethod,
+                    List.of(new MatchDecision(pendingMethod, newMethod, MatchStatus.SUGGESTED, score)));
+        }
+        DiffNode changedClass = new DiffNode("class", "owner", EntityKind.CLASS,
+                oldClass, newClass, java.util.Set.of(ChangeKind.CODE));
+        DiffNode changedResource = new DiffNode("resource", "changed.txt", EntityKind.RESOURCE,
+                EntityId.resourceId("changed.txt"), EntityId.resourceId("changed.txt"),
+                java.util.Set.of(ChangeKind.RESOURCE));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(confirmed, memberCandidates, java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(changedClass, changedResource), Map.of()), Map.of(),
+                List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.summaryValuesForTesting().subList(2, 5)).containsExactly(1L, 0L, 1L);
         controller.close();
     }
 
@@ -146,13 +185,187 @@ class WorkspacePanelTest {
         SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
 
         assertThat(result.panel.rootKeysForTesting()).containsExactly(
-                "status:changed", "status:unmatched", "status:unchanged");
+                "status:changed", "status:unchanged");
         assertThat(result.panel.stableTreeKeysForTesting())
-                .contains("status:changed:classes", "status:unmatched:members", "status:unchanged:resources")
-                .anyMatch(key -> key.startsWith("member-owner:unmatched:L:old/Changed"));
+                .contains("status:changed:classes", "status:unchanged:resources")
+                .doesNotContain("status:unmatched:members");
         assertThat(result.panel.stableTreeKeysForTesting().stream()
                 .filter(key -> key.equals("entity:L:CLASS:old/Changed")))
                 .hasSize(1);
+        SwingUtilities.invokeAndWait(() -> result.panel.expandEntityForTesting("entity:L:CLASS:old/Changed"));
+        assertThat(result.panel.stableTreeKeysForTesting())
+                .contains("entity:L:METHOD:old/Changed.missing()V");
+        controller.close();
+    }
+
+    @Test
+    void treatsPureRenamesAsUnchangedAndAppliesManualClassification() throws Exception {
+        EntityId leftClass = EntityId.classId("old/Owner");
+        EntityId rightClass = EntityId.classId("new/Owner");
+        EntityId leftMethod = EntityId.methodId("old/Owner", "read", "()I");
+        EntityId rightMethod = EntityId.methodId("new/Owner", "a", "()I");
+        DiffNode classNode = new DiffNode("class:rename", "old/Owner -> new/Owner", EntityKind.CLASS,
+                leftClass, rightClass, java.util.Set.of(ChangeKind.RENAMED));
+        DiffNode methodNode = new DiffNode("method:rename", "read -> a", EntityKind.METHOD,
+                leftMethod, rightMethod, java.util.Set.of(ChangeKind.RENAMED));
+        MatchDecision perfect = new MatchDecision(leftClass, rightClass, MatchStatus.EXACT,
+                new ScoreBreakdown(1.0, Map.of("fingerprint", 1.0)));
+        ComparisonOverrides overrides = new ComparisonOverrides(Map.of(), java.util.Set.of(), java.util.Set.of(),
+                java.util.Set.of(), Map.of(new ClassPair(leftClass, rightClass),
+                        ClassClassification.FORCE_CHANGED));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(perfect), Map.of(), java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(classNode, methodNode), Map.of()), overrides,
+                List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:changed");
+        assertThat(result.panel.treeLabelForKeyForTesting("entity:L:CLASS:old/Owner"))
+                .doesNotContain("[", "Manual classification");
+        assertThat(result.panel.treeTooltipForKeyForTesting("entity:L:CLASS:old/Owner"))
+                .isEqualTo(org.earthsworth.wmatcher.app.I18n.text("tree.manualClassificationChanged"));
+
+        javax.swing.tree.TreeModel treeModel = result.panel.treeForTesting().getModel();
+        WorkspaceController.Workspace automatic = new WorkspaceController.Workspace(
+                workspace.left(), workspace.right(), workspace.matches(), workspace.differences(),
+                ComparisonOverrides.EMPTY, List.of(), List.of(), null, "", ProjectUiState.empty());
+        SwingUtilities.invokeAndWait(() -> result.panel.refresh(automatic));
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:unchanged");
+        assertThat(result.panel.treeForTesting().getModel()).isSameAs(treeModel);
+        controller.close();
+    }
+
+    @Test
+    void resolvesPopupTargetsAcrossTheWholeTreeRowOnly() throws Exception {
+        DiffNode node = new DiffNode("class", "sample/Owner", EntityKind.CLASS,
+                EntityId.classId("sample/Owner"), null, java.util.Set.of(ChangeKind.UNRESOLVED));
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+        SwingUtilities.invokeAndWait(() -> {
+            result.panel = new WorkspacePanel(controller, workspace(node), ignored -> { });
+            result.panel.treeForTesting().setSize(700, 500);
+            result.panel.treeForTesting().doLayout();
+        });
+        JTree tree = result.panel.treeForTesting();
+        int row = Math.max(0, tree.getRowCount() - 1);
+        java.awt.Rectangle bounds = tree.getRowBounds(row);
+
+        assertThat(WorkspacePanel.popupPathAt(tree, 690, bounds.y + bounds.height / 2))
+                .isEqualTo(tree.getPathForRow(row));
+        assertThat(WorkspacePanel.popupPathAt(tree, 690, bounds.y + bounds.height + 20)).isNull();
+        controller.close();
+    }
+
+    @Test
+    void appliesManualClassificationWithoutReplacingTheTreeRoot() throws Exception {
+        EntityId leftClass = EntityId.classId("old/Owner");
+        EntityId rightClass = EntityId.classId("new/Owner");
+        DiffNode classNode = new DiffNode("class", "owner", EntityKind.CLASS,
+                leftClass, rightClass, java.util.Set.of());
+        MatchDecision decision = new MatchDecision(leftClass, rightClass, MatchStatus.EXACT,
+                new ScoreBreakdown(1.0, Map.of("fingerprint", 1.0)));
+        WorkspaceController.Workspace automatic = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(decision), Map.of(), java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(classNode), Map.of()), ComparisonOverrides.EMPTY,
+                List.of(), List.of(), null, "", ProjectUiState.empty());
+        ComparisonOverrides overrides = new ComparisonOverrides(Map.of(), java.util.Set.of(), java.util.Set.of(),
+                java.util.Set.of(), Map.of(new ClassPair(leftClass, rightClass),
+                        ClassClassification.FORCE_CHANGED));
+        WorkspaceController.Workspace classified = new WorkspaceController.Workspace(
+                automatic.left(), automatic.right(), automatic.matches(), automatic.differences(), overrides,
+                List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, automatic, ignored -> { }));
+        Object root = result.panel.treeForTesting().getModel().getRoot();
+
+        SwingUtilities.invokeAndWait(() -> result.panel.applyAnalysisUpdateForTesting(
+                new WorkspaceController.AnalysisUpdate(classified, java.util.Set.of(leftClass, rightClass), false,
+                        WorkspaceController.PhaseTimings.ZERO)));
+
+        assertThat(result.panel.treeForTesting().getModel().getRoot()).isSameAs(root);
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:changed");
+        assertThat(result.panel.treeTooltipForKeyForTesting("entity:L:CLASS:old/Owner"))
+                .isEqualTo(org.earthsworth.wmatcher.app.I18n.text("tree.manualClassificationChanged"));
+        controller.close();
+    }
+
+    @Test
+    void groupsUnmatchedClassesAndResourcesByOldAndNewSide() throws Exception {
+        DiffNode oldClass = new DiffNode("old", "old/Only", EntityKind.CLASS,
+                EntityId.classId("old/Only"), null, java.util.Set.of(ChangeKind.UNRESOLVED));
+        DiffNode newResource = new DiffNode("new", "new.txt", EntityKind.RESOURCE,
+                null, EntityId.resourceId("new.txt"), java.util.Set.of(ChangeKind.ADDED));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(oldClass.left()),
+                        java.util.Set.of(newResource.right())),
+                new DiffResult(List.of(oldClass, newResource), Map.of()), Map.of(), List.of(), List.of(), null, "",
+                ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.stableTreeKeysForTesting()).contains(
+                "status:unmatched:old", "status:unmatched:old:classes",
+                "status:unmatched:new", "status:unmatched:new:resources");
+        controller.close();
+    }
+
+    @Test
+    void memberSelectionUsesItsOwningClassAsTheMappingSubject() throws Exception {
+        EntityId leftClass = EntityId.classId("old/Owner");
+        EntityId rightClass = EntityId.classId("new/Owner");
+        DiffNode classNode = new DiffNode("class", "owner", EntityKind.CLASS,
+                leftClass, rightClass, java.util.Set.of());
+        DiffNode method = new DiffNode("method", "method", EntityKind.METHOD,
+                EntityId.methodId("old/Owner", "work", "()V"),
+                EntityId.methodId("new/Owner", "work", "()V"), java.util.Set.of(ChangeKind.CODE));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(classNode, method), Map.of()), Map.of(), List.of(), List.of(), null, "",
+                ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.mappingSubjectForTesting(method)).isEqualTo(leftClass);
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:unchanged");
+        controller.close();
+    }
+
+    @Test
+    void classLevelUnchangedStatusIsNotOverriddenByMemberResolutionNoise() throws Exception {
+        EntityId leftClass = EntityId.classId("old/Stable");
+        EntityId rightClass = EntityId.classId("new/Stable");
+        DiffNode classNode = new DiffNode("class", "stable", EntityKind.CLASS,
+                leftClass, rightClass, java.util.Set.of());
+        DiffNode unresolved = new DiffNode("unresolved", "candidate", EntityKind.METHOD,
+                EntityId.methodId("old/Stable", "a", "()V"), null,
+                java.util.Set.of(ChangeKind.UNRESOLVED));
+        DiffNode added = new DiffNode("added", "added", EntityKind.FIELD, null,
+                EntityId.fieldId("new/Stable", "b", "I"), java.util.Set.of(ChangeKind.ADDED));
+        DiffNode removed = new DiffNode("removed", "removed", EntityKind.FIELD,
+                EntityId.fieldId("old/Stable", "c", "I"), null, java.util.Set.of(ChangeKind.REMOVED));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(classNode, unresolved, added, removed), Map.of()),
+                Map.of(), List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:unchanged");
         controller.close();
     }
 
@@ -202,7 +415,8 @@ class WorkspacePanelTest {
         SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
 
         assertThat(result.panel.uiState().expandedTreeKeys())
-                .contains("status:changed:classes", "status:unmatched:classes", "status:unchanged:classes",
+                .contains("status:changed:classes", "status:unmatched:old:classes",
+                        "status:unmatched:new:classes", "status:unchanged:classes",
                         "package:*:classes:sample", "package:*:classes:sample/deep");
         controller.close();
     }
