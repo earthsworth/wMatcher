@@ -1,0 +1,41 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    api project(':wmatcher-core')
+
+    implementation libs.asm
+    implementation libs.asm.tree
+    implementation libs.asm.util
+    implementation libs.asm.commons
+    implementation libs.asm.analysis
+    implementation libs.vineflower
+    implementation libs.diffutils
+    implementation libs.mappingio
+    implementation libs.jackson.databind
+    implementation libs.slf4j
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.junit.jupiter
+    testImplementation libs.assertj
+    testRuntimeOnly libs.junit.launcher
+}
+
+tasks.named('test') {
+    useJUnitPlatform {
+        excludeTags 'performance'
+    }
+}
+
+tasks.register('performanceTest', Test) {
+    description = 'Runs the opt-in 50,000-class acceptance benchmark.'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    maxHeapSize = '2g'
+    useJUnitPlatform {
+        includeTags 'performance'
+    }
+    systemProperty 'wmatcher.performance.classes', System.getProperty('wmatcher.performance.classes', '50000')
+}

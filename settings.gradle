@@ -1,1 +1,13 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.PREFER_PROJECT
+}
+
 rootProject.name = 'wMatcher'
+include 'wmatcher-core', 'wmatcher-engine', 'wmatcher-app'

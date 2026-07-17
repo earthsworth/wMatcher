@@ -1,20 +1,70 @@
 plugins {
-    id 'java'
+    id 'base'
 }
 
 group = 'org.earthsworth.wmatcher'
-version = '1.0-SNAPSHOT'
+version = '1.0.0'
 
-repositories {
-    mavenCentral()
+subprojects {
+    group = rootProject.group
+    version = rootProject.version
+
+    repositories {
+        mavenCentral()
+        maven { url = uri('https://maven.fabricmc.net/') }
+    }
+
+    plugins.withType(JavaPlugin).configureEach {
+        java {
+            toolchain {
+                languageVersion = JavaLanguageVersion.of(21)
+            }
+            withSourcesJar()
+        }
+
+        tasks.withType(JavaCompile).configureEach {
+            options.encoding = 'UTF-8'
+            options.release = 21
+            options.compilerArgs.addAll(['-Xlint:all,-serial', '-Werror'])
+        }
+
+        tasks.withType(Test).configureEach {
+            useJUnitPlatform()
+            def runtimeTemp = layout.buildDirectory.dir('tmp/test-runtime')
+            systemProperty 'java.io.tmpdir', runtimeTemp.get().asFile.absolutePath
+            doFirst {
+                runtimeTemp.get().asFile.mkdirs()
+            }
+            testLogging {
+                events 'failed', 'skipped'
+                exceptionFormat = 'full'
+            }
+        }
+
+        tasks.withType(AbstractArchiveTask).configureEach {
+            preserveFileTimestamps = false
+            reproducibleFileOrder = true
+        }
+
+        dependencyLocking {
+            lockAllConfigurations()
+        }
+    }
 }
 
-dependencies {
-    testImplementation platform('org.junit:junit-bom:5.10.0')
-    testImplementation 'org.junit.jupiter:junit-jupiter'
-    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+tasks.register('shadowJar') {
+    group = 'build'
+    description = 'Builds the runnable wMatcher fat JAR.'
+    dependsOn ':wmatcher-app:shadowJar'
 }
 
-test {
-    useJUnitPlatform()
+tasks.register('thirdPartyLicenses', Copy) {
+    group = 'documentation'
+    description = 'Copies the audited third-party dependency license inventory.'
+    from layout.projectDirectory.file('THIRD_PARTY_LICENSES.md')
+    into layout.buildDirectory.dir('reports/licenses')
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('thirdPartyLicenses')
 }

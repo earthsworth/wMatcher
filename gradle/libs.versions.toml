@@ -1,0 +1,35 @@
+[versions]
+asm = "9.10.1"
+vineflower = "1.12.0"
+flatlaf = "3.7.2"
+rsyntaxtextarea = "3.6.3"
+diffutils = "4.17"
+mappingio = "0.8.0"
+jackson = "2.22.1"
+slf4j = "2.0.18"
+logback = "1.5.38"
+junit = "6.1.2"
+assertj = "3.27.7"
+shadow = "9.6.0"
+
+[libraries]
+asm = { module = "org.ow2.asm:asm", version.ref = "asm" }
+asm-tree = { module = "org.ow2.asm:asm-tree", version.ref = "asm" }
+asm-util = { module = "org.ow2.asm:asm-util", version.ref = "asm" }
+asm-commons = { module = "org.ow2.asm:asm-commons", version.ref = "asm" }
+asm-analysis = { module = "org.ow2.asm:asm-analysis", version.ref = "asm" }
+vineflower = { module = "org.vineflower:vineflower", version.ref = "vineflower" }
+flatlaf = { module = "com.formdev:flatlaf", version.ref = "flatlaf" }
+rsyntaxtextarea = { module = "com.fifesoft:rsyntaxtextarea", version.ref = "rsyntaxtextarea" }
+diffutils = { module = "io.github.java-diff-utils:java-diff-utils", version.ref = "diffutils" }
+mappingio = { module = "net.fabricmc:mapping-io", version.ref = "mappingio" }
+jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
+slf4j = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+logback = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+assertj = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+
+[plugins]
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }
