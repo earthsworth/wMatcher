@@ -71,6 +71,9 @@ public final class WorkspacePanel extends JPanel {
     private final JTextArea overview = new JTextArea();
     private final CandidateTableModel candidateModel = new CandidateTableModel();
     private final JTable candidates = new JTable(candidateModel);
+    private final JButton lockCandidate = new JButton(text("candidate.lock"));
+    private final JButton unlockCandidate = new JButton(text("candidate.unlock"));
+    private final JButton manualCandidate = new JButton(text("candidate.manual"));
     private final SideBySideTextPanel structure = new SideBySideTextPanel();
     private final SideBySideTextPanel bytecode = new SideBySideTextPanel();
     private final SideBySideTextPanel source = new SideBySideTextPanel();
@@ -127,6 +130,12 @@ public final class WorkspacePanel extends JPanel {
 
     public void redo() {
         controller.redoMappings(this::mappingChanged, errorHandler);
+    }
+
+    public void setMinimapsVisible(boolean visible) {
+        structure.setMinimapVisible(visible);
+        bytecode.setMinimapVisible(visible);
+        source.setMinimapVisible(visible);
     }
 
     private void buildUi() {
@@ -252,18 +261,17 @@ public final class WorkspacePanel extends JPanel {
         JPanel panel = new JPanel(new BorderLayout());
         candidates.setAutoCreateRowSorter(true);
         candidates.setFillsViewportHeight(true);
+        candidates.getSelectionModel().addListSelectionListener(event -> updateCandidateActions());
         panel.add(new JScrollPane(candidates), BorderLayout.CENTER);
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JButton lock = new JButton(text("candidate.lock"));
-        lock.addActionListener(event -> lockSelectedCandidate());
-        JButton unlock = new JButton(text("candidate.unlock"));
-        unlock.addActionListener(event -> unlockSelected());
-        JButton manual = new JButton(text("candidate.manual"));
-        manual.addActionListener(event -> chooseManual());
-        actions.add(lock);
-        actions.add(unlock);
-        actions.add(manual);
+        lockCandidate.addActionListener(event -> lockSelectedCandidate());
+        unlockCandidate.addActionListener(event -> unlockSelected());
+        manualCandidate.addActionListener(event -> chooseManual());
+        actions.add(lockCandidate);
+        actions.add(unlockCandidate);
+        actions.add(manualCandidate);
         panel.add(actions, BorderLayout.SOUTH);
+        updateCandidateActions();
         return panel;
     }
 
@@ -442,9 +450,29 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void updateCandidates(DiffNode node) {
-        List<MatchDecision> matches = node.left() == null
-                ? List.of() : workspace.matches().candidates().getOrDefault(node.left(), List.of());
-        candidateModel.setRows(matches);
+        if (node.left() == null) {
+            candidateModel.setRows(List.of());
+            updateCandidateActions();
+            return;
+        }
+        EntityId left = node.left();
+        MatchDecision current = currentMatch(left);
+        List<CandidateRow> rows = new ArrayList<>();
+        if (current != null) {
+            rows.add(new CandidateRow(current, true, false));
+        }
+        List<MatchDecision> ranked = workspace.matches().rankedCandidates()
+                .getOrDefault(left, workspace.matches().candidates().getOrDefault(left, List.of()));
+        for (MatchDecision candidate : ranked) {
+            if (current == null || !candidate.right().equals(current.right())) {
+                rows.add(new CandidateRow(candidate, false, current != null));
+            }
+        }
+        candidateModel.setRows(rows);
+        if (!rows.isEmpty()) {
+            candidates.setRowSelectionInterval(0, 0);
+        }
+        updateCandidateActions();
     }
 
     private void lockSelectedCandidate() {
@@ -452,8 +480,8 @@ public final class WorkspacePanel extends JPanel {
         if (viewRow < 0) {
             return;
         }
-        MatchDecision decision = candidateModel.row(candidates.convertRowIndexToModel(viewRow));
-        controller.lockMapping(decision, this::mappingChanged, errorHandler);
+        CandidateRow row = candidateModel.row(candidates.convertRowIndexToModel(viewRow));
+        confirmAndLock(row.decision());
     }
 
     private void unlockSelected() {
@@ -467,21 +495,91 @@ public final class WorkspacePanel extends JPanel {
             return;
         }
         EntityId left = selected.left();
-        List<EntityId> options = workspace.matches().unmatchedRight().stream()
-                .filter(right -> right.kind() == left.kind())
-                .filter(right -> ownersCompatible(left, right))
-                .sorted(Comparator.comparing(EntityId::externalName))
-                .toList();
-        if (options.isEmpty()) {
+        List<ManualMatchDialog.Choice> choices = manualChoices(left);
+        if (choices.isEmpty()) {
+            JOptionPane.showMessageDialog(this, text("dialog.noManualTargets"), text("candidate.manual"),
+                    JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        EntityId chosen = (EntityId) JOptionPane.showInputDialog(this, text("dialog.manual"),
-                text("candidate.manual"), JOptionPane.PLAIN_MESSAGE, null, options.toArray(), options.getFirst());
+        EntityId chosen = ManualMatchDialog.showDialog(this, left, choices);
         if (chosen != null) {
-            MatchDecision manual = new MatchDecision(left, chosen, MatchStatus.SUGGESTED,
-                    new ScoreBreakdown(0.0, Map.of("manual", 0.0)));
-            controller.lockMapping(manual, this::mappingChanged, errorHandler);
+            ScoreBreakdown score = workspace.matches().rankedCandidates().getOrDefault(left, List.of()).stream()
+                    .filter(candidate -> candidate.right().equals(chosen))
+                    .map(MatchDecision::score)
+                    .findFirst()
+                    .orElseGet(() -> new ScoreBreakdown(0.0, Map.of("manual", 0.0)));
+            confirmAndLock(new MatchDecision(left, chosen, MatchStatus.SUGGESTED, score));
         }
+    }
+
+    private List<ManualMatchDialog.Choice> manualChoices(EntityId left) {
+        Map<EntityId, EntityId> occupants = new HashMap<>();
+        workspace.matches().confirmed().forEach(match -> occupants.put(match.right(), match.left()));
+        Set<EntityId> targets = new LinkedHashSet<>(workspace.matches().unmatchedRight());
+        targets.addAll(occupants.keySet());
+        MatchDecision current = currentMatch(left);
+        EntityId currentRight = current == null ? null : current.right();
+        return targets.stream()
+                .filter(right -> manuallyCompatible(left, right))
+                .sorted(Comparator.comparing(EntityId::externalName))
+                .map(right -> new ManualMatchDialog.Choice(
+                        right, occupants.get(right), right.equals(currentRight)))
+                .toList();
+    }
+
+    private boolean manuallyCompatible(EntityId left, EntityId right) {
+        if (right.kind() != left.kind() || !ownersCompatible(left, right)) {
+            return false;
+        }
+        if (left.kind() != EntityKind.METHOD) {
+            return true;
+        }
+        boolean leftSpecial = left.name().startsWith("<");
+        boolean rightSpecial = right.name().startsWith("<");
+        return leftSpecial == rightSpecial && (!leftSpecial || left.name().equals(right.name()));
+    }
+
+    private void confirmAndLock(MatchDecision decision) {
+        EntityId occupant = workspace.matches().confirmed().stream()
+                .filter(match -> match.right().equals(decision.right()))
+                .map(MatchDecision::left)
+                .filter(left -> !left.equals(decision.left()))
+                .findFirst()
+                .orElse(null);
+        if (!replacementAccepted(decision.left(), occupant, () -> JOptionPane.showConfirmDialog(this,
+                text("dialog.replaceMapping", decision.right().externalName(), occupant.externalName()),
+                text("dialog.replaceMappingTitle"), JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE) == JOptionPane.YES_OPTION)) {
+            return;
+        }
+        controller.lockMapping(decision, this::mappingChanged, errorHandler);
+    }
+
+    static boolean replacementAccepted(
+            EntityId source,
+            EntityId occupant,
+            java.util.function.BooleanSupplier confirmation) {
+        return occupant == null || occupant.equals(source) || confirmation.getAsBoolean();
+    }
+
+    private MatchDecision currentMatch(EntityId left) {
+        return workspace.matches().confirmed().stream()
+                .filter(match -> match.left().equals(left))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private void updateCandidateActions() {
+        int viewRow = candidates.getSelectedRow();
+        CandidateRow row = viewRow < 0 ? null
+                : candidateModel.row(candidates.convertRowIndexToModel(viewRow));
+        boolean alreadyLocked = row != null && row.current()
+                && row.decision().status() == MatchStatus.MANUAL_LOCKED;
+        lockCandidate.setEnabled(row != null && !alreadyLocked);
+        unlockCandidate.setEnabled(selected != null && selected.left() != null
+                && workspace.lockedMappings().containsKey(selected.left()));
+        manualCandidate.setEnabled(selected != null && selected.left() != null
+                && selected.left().kind() != EntityKind.RESOURCE);
     }
 
     private boolean ownersCompatible(EntityId left, EntityId right) {
@@ -645,6 +743,21 @@ public final class WorkspacePanel extends JPanel {
         return workspaceSplit;
     }
 
+    JTable candidatesForTesting() {
+        return candidates;
+    }
+
+    boolean minimapsVisibleForTesting() {
+        return structure.leftMinimapForTesting().isVisible()
+                && bytecode.leftMinimapForTesting().isVisible()
+                && source.leftMinimapForTesting().isVisible();
+    }
+
+    void selectForTesting(DiffNode node) {
+        selected = node;
+        updateCandidates(node);
+    }
+
     private enum FilterKind { ALL, CHANGED, ADDED, REMOVED, MODIFIED, UNRESOLVED }
 
     private record FilterOption(String label, FilterKind kind) {
@@ -683,18 +796,21 @@ public final class WorkspacePanel extends JPanel {
         }
     }
 
+    private record CandidateRow(MatchDecision decision, boolean current, boolean alternative) { }
+
     private static final class CandidateTableModel extends AbstractTableModel {
         private final String[] columns = {
-            text("candidate.left"), text("candidate.right"), text("candidate.score"), text("candidate.reasons")
+            text("candidate.status"), text("candidate.left"), text("candidate.right"),
+            text("candidate.score"), text("candidate.reasons")
         };
-        private List<MatchDecision> rows = List.of();
+        private List<CandidateRow> rows = List.of();
 
-        void setRows(List<MatchDecision> values) {
+        void setRows(List<CandidateRow> values) {
             rows = List.copyOf(values);
             fireTableDataChanged();
         }
 
-        MatchDecision row(int index) {
+        CandidateRow row(int index) {
             return rows.get(index);
         }
 
@@ -704,16 +820,30 @@ public final class WorkspacePanel extends JPanel {
 
         @Override
         public Object getValueAt(int rowIndex, int columnIndex) {
-            MatchDecision match = rows.get(rowIndex);
+            CandidateRow row = rows.get(rowIndex);
+            MatchDecision match = row.decision();
             return switch (columnIndex) {
-                case 0 -> match.left().externalName();
-                case 1 -> match.right().externalName();
-                case 2 -> String.format(Locale.ROOT, "%.1f%%", match.score().total() * 100);
-                case 3 -> match.score().components().entrySet().stream()
+                case 0 -> row.current()
+                        ? text("candidate.status.current", statusText(match.status()))
+                        : row.alternative() ? text("candidate.status.alternative")
+                        : statusText(match.status());
+                case 1 -> match.left().externalName();
+                case 2 -> match.right().externalName();
+                case 3 -> String.format(Locale.ROOT, "%.1f%%", match.score().total() * 100);
+                case 4 -> match.score().components().entrySet().stream()
                         .sorted(Map.Entry.comparingByKey())
                         .map(entry -> entry.getKey() + '=' + String.format(Locale.ROOT, "%.2f", entry.getValue()))
                         .collect(java.util.stream.Collectors.joining(", "));
                 default -> "";
+            };
+        }
+
+        private static String statusText(MatchStatus status) {
+            return switch (status) {
+                case EXACT -> text("candidate.status.exact");
+                case AUTO_CONFIRMED -> text("candidate.status.auto");
+                case MANUAL_LOCKED -> text("candidate.status.locked");
+                case SUGGESTED -> text("candidate.status.suggested");
             };
         }
     }

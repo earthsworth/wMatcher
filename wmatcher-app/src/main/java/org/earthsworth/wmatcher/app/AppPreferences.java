@@ -14,6 +14,7 @@ public final class AppPreferences {
     private static final Preferences PREFERENCES = Preferences.userNodeForPackage(WMatcherApplication.class);
     private static final String LANGUAGE = "language";
     private static final String THEME = "theme";
+    private static final String MINIMAP_VISIBLE = "minimapVisible";
     private static final String RECENT_PROJECT = "recentProject";
     private static final String RECENT_PATH = "recent.path.";
     private static final String RECENT_TIME = "recent.time.";
@@ -40,6 +41,14 @@ public final class AppPreferences {
 
     public static void setTheme(String theme) {
         PREFERENCES.put(THEME, theme);
+    }
+
+    public static boolean minimapVisible() {
+        return minimapVisible(PREFERENCES);
+    }
+
+    public static void setMinimapVisible(boolean visible) {
+        setMinimapVisible(PREFERENCES, visible);
     }
 
     public static Optional<Path> recentProject() {
@@ -104,6 +113,14 @@ public final class AppPreferences {
                 .filter(project -> !project.path().equals(normalized))
                 .toList();
         writeRecentProjects(preferences, recent);
+    }
+
+    static boolean minimapVisible(Preferences preferences) {
+        return preferences.getBoolean(MINIMAP_VISIBLE, true);
+    }
+
+    static void setMinimapVisible(Preferences preferences, boolean visible) {
+        preferences.putBoolean(MINIMAP_VISIBLE, visible);
     }
 
     private static void writeRecentProjects(Preferences preferences, List<RecentProject> recent) {

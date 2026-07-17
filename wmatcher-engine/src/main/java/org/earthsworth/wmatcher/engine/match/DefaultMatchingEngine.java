@@ -50,6 +50,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
 
         List<MatchDecision> confirmed = new ArrayList<>();
         Map<EntityId, List<MatchDecision>> suggestions = new LinkedHashMap<>();
+        Map<EntityId, List<MatchDecision>> rankedCandidates = new LinkedHashMap<>();
         Set<EntityId> usedLeft = new HashSet<>();
         Set<EntityId> usedRight = new HashSet<>();
         for (Map.Entry<EntityId, EntityId> locked : overrides.locked().entrySet()) {
@@ -61,7 +62,8 @@ public final class DefaultMatchingEngine implements MatchingEngine {
         }
 
         progress.onProgress("Matching classes", 0, left.classes().size());
-        matchClasses(left, right, policy, confirmed, suggestions, usedLeft, usedRight, progress, cancellation);
+        matchClasses(left, right, policy, confirmed, suggestions, rankedCandidates,
+                usedLeft, usedRight, progress, cancellation);
 
         Map<String, String> classPairs = confirmed.stream()
                 .filter(match -> match.left().kind() == org.earthsworth.wmatcher.core.model.EntityKind.CLASS)
@@ -76,8 +78,10 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             ClassModel leftClass = left.classes().get(pair.getKey());
             ClassModel rightClass = right.classes().get(pair.getValue());
             if (leftClass != null && rightClass != null) {
-                matchFields(leftClass, rightClass, policy, confirmed, suggestions, usedLeft, usedRight);
-                matchMethods(leftClass, rightClass, policy, confirmed, suggestions, usedLeft, usedRight);
+                matchFields(leftClass, rightClass, policy, confirmed, suggestions, rankedCandidates,
+                        usedLeft, usedRight);
+                matchMethods(leftClass, rightClass, policy, confirmed, suggestions, rankedCandidates,
+                        usedLeft, usedRight);
             }
             progress.onProgress("Matching members", ++completed, classPairs.size());
         }
@@ -94,7 +98,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             unmatchedLeft.remove(match.left());
             unmatchedRight.remove(match.right());
         });
-        return new MatchResult(confirmed, suggestions, unmatchedLeft, unmatchedRight);
+        return new MatchResult(confirmed, suggestions, rankedCandidates, unmatchedLeft, unmatchedRight);
     }
 
     private static void matchClasses(
@@ -103,6 +107,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             MatchingPolicy policy,
             List<MatchDecision> confirmed,
             Map<EntityId, List<MatchDecision>> suggestions,
+            Map<EntityId, List<MatchDecision>> rankedCandidates,
             Set<EntityId> usedLeft,
             Set<EntityId> usedRight,
             ProgressListener progress,
@@ -183,6 +188,8 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             }
             progress.onProgress("Matching classes", ++completed, orderedLeft.size());
         }
+        recordRankedCandidates(scored, rankedCandidates, policy);
+        acceptUniquePerfect(scored, confirmed, usedLeft, usedRight);
         acceptMutualCandidates(scored, policy, confirmed, suggestions, usedLeft, usedRight);
     }
 
@@ -192,6 +199,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             MatchingPolicy policy,
             List<MatchDecision> confirmed,
             Map<EntityId, List<MatchDecision>> suggestions,
+            Map<EntityId, List<MatchDecision>> rankedCandidates,
             Set<EntityId> usedLeft,
             Set<EntityId> usedRight) {
         Map<EntityId, List<CandidateScore>> scored = new LinkedHashMap<>();
@@ -210,7 +218,8 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                     .toList();
             scored.put(leftId, candidates);
         }
-        acceptUniqueExact(scored, confirmed, usedLeft, usedRight);
+        recordRankedCandidates(scored, rankedCandidates, policy);
+        acceptUniquePerfect(scored, confirmed, usedLeft, usedRight);
         acceptMutualCandidates(scored, policy, confirmed, suggestions, usedLeft, usedRight);
     }
 
@@ -220,6 +229,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             MatchingPolicy policy,
             List<MatchDecision> confirmed,
             Map<EntityId, List<MatchDecision>> suggestions,
+            Map<EntityId, List<MatchDecision>> rankedCandidates,
             Set<EntityId> usedLeft,
             Set<EntityId> usedRight) {
         Map<EntityId, List<CandidateScore>> scored = new LinkedHashMap<>();
@@ -239,22 +249,23 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                     .toList();
             scored.put(leftId, candidates);
         }
-        acceptUniqueExact(scored, confirmed, usedLeft, usedRight);
+        recordRankedCandidates(scored, rankedCandidates, policy);
+        acceptUniquePerfect(scored, confirmed, usedLeft, usedRight);
         acceptMutualCandidates(scored, policy, confirmed, suggestions, usedLeft, usedRight);
     }
 
-    private static void acceptUniqueExact(
+    private static void acceptUniquePerfect(
             Map<EntityId, List<CandidateScore>> scored,
             List<MatchDecision> confirmed,
             Set<EntityId> usedLeft,
             Set<EntityId> usedRight) {
         Map<EntityId, Long> rightPerfectCounts = scored.values().stream()
                 .flatMap(Collection::stream)
-                .filter(candidate -> candidate.breakdown().total() == 1.0)
+                .filter(DefaultMatchingEngine::isPerfect)
                 .collect(Collectors.groupingBy(CandidateScore::right, Collectors.counting()));
         for (Map.Entry<EntityId, List<CandidateScore>> entry : scored.entrySet()) {
             List<CandidateScore> perfect = entry.getValue().stream()
-                    .filter(candidate -> candidate.breakdown().total() == 1.0)
+                    .filter(DefaultMatchingEngine::isPerfect)
                     .toList();
             if (perfect.size() == 1 && rightPerfectCounts.getOrDefault(perfect.getFirst().right(), 0L) == 1L
                     && !usedLeft.contains(entry.getKey()) && !usedRight.contains(perfect.getFirst().right())) {
@@ -273,6 +284,10 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             Map<EntityId, List<MatchDecision>> suggestions,
             Set<EntityId> usedLeft,
             Set<EntityId> usedRight) {
+        Map<EntityId, Long> rightPerfectCounts = scored.values().stream()
+                .flatMap(Collection::stream)
+                .filter(DefaultMatchingEngine::isPerfect)
+                .collect(Collectors.groupingBy(CandidateScore::right, Collectors.counting()));
         Map<EntityId, CandidateScore> rightBest = new HashMap<>();
         Map<EntityId, EntityId> rightBestLeft = new HashMap<>();
         for (Map.Entry<EntityId, List<CandidateScore>> entry : scored.entrySet()) {
@@ -292,10 +307,14 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             List<CandidateScore> candidates = entry.getValue();
             CandidateScore best = candidates.getFirst();
             double runnerUp = candidates.size() > 1 ? candidates.get(1).breakdown().total() : 0.0;
+            long leftPerfectCount = candidates.stream().filter(DefaultMatchingEngine::isPerfect).count();
+            boolean perfectIsUnambiguous = !isPerfect(best)
+                    || leftPerfectCount == 1 && rightPerfectCounts.getOrDefault(best.right(), 0L) == 1L;
             boolean automatic = best.breakdown().total() >= policy.automaticThreshold()
                     && best.breakdown().total() - runnerUp >= policy.minimumMargin()
                     && left.equals(rightBestLeft.get(best.right()))
-                    && !usedRight.contains(best.right());
+                    && !usedRight.contains(best.right())
+                    && perfectIsUnambiguous;
             if (automatic) {
                 confirmed.add(new MatchDecision(left, best.right(), MatchStatus.AUTO_CONFIRMED, best.breakdown()));
                 usedLeft.add(left);
@@ -308,6 +327,21 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                         .toList());
             }
         }
+    }
+
+    private static void recordRankedCandidates(
+            Map<EntityId, List<CandidateScore>> scored,
+            Map<EntityId, List<MatchDecision>> rankedCandidates,
+            MatchingPolicy policy) {
+        scored.forEach((left, candidates) -> rankedCandidates.put(left, candidates.stream()
+                .limit(policy.maxCandidates())
+                .map(candidate -> new MatchDecision(left, candidate.right(), MatchStatus.SUGGESTED,
+                        candidate.breakdown()))
+                .toList()));
+    }
+
+    private static boolean isPerfect(CandidateScore candidate) {
+        return candidate.breakdown().total() >= 1.0 - 1.0e-12;
     }
 
     private static CandidateScore classScore(ClassModel left, ClassModel right) {

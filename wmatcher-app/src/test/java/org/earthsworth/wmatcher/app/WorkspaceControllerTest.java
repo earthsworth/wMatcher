@@ -4,13 +4,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
+import org.earthsworth.wmatcher.core.model.EntityId;
+import org.earthsworth.wmatcher.core.model.EntityKind;
+import org.earthsworth.wmatcher.core.model.MatchDecision;
+import org.earthsworth.wmatcher.core.model.MatchStatus;
+import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.objectweb.asm.ClassWriter;
@@ -86,6 +93,42 @@ class WorkspaceControllerTest {
         reopened.close();
     }
 
+    @Test
+    void changingAClassMappingClearsDependentMemberLocksAsOneUndoableEdit() throws Exception {
+        Path left = jar("cascade-old.jar", "same/Owner", "read");
+        Path right = jar("cascade-new.jar", Map.of(
+                "same/Owner", "read",
+                "alternative/Owner", "read"));
+        WorkspaceController controller = new WorkspaceController();
+        WorkspaceController.Workspace compared = compare(controller, left, right);
+        MatchDecision method = compared.matches().confirmed().stream()
+                .filter(match -> match.left().kind() == EntityKind.METHOD)
+                .filter(match -> match.left().name().equals("read"))
+                .findFirst()
+                .orElseThrow();
+
+        WorkspaceController.Workspace memberLocked = awaitMapping(
+                (success, failure) -> controller.lockMapping(method, success, failure));
+        assertThat(memberLocked.lockedMappings()).containsKey(method.left());
+
+        MatchDecision replacement = new MatchDecision(
+                EntityId.classId("same/Owner"),
+                EntityId.classId("alternative/Owner"),
+                MatchStatus.SUGGESTED,
+                new ScoreBreakdown(0.95, Map.of("manual", 0.95)));
+        WorkspaceController.Workspace classLocked = awaitMapping(
+                (success, failure) -> controller.lockMapping(replacement, success, failure));
+
+        assertThat(classLocked.lockedMappings()).containsEntry(replacement.left(), replacement.right());
+        assertThat(classLocked.lockedMappings().keySet())
+                .noneMatch(id -> id.kind() == EntityKind.FIELD || id.kind() == EntityKind.METHOD);
+
+        WorkspaceController.Workspace undone = awaitMapping(controller::undoMappings);
+        assertThat(undone.lockedMappings()).containsKey(method.left());
+        assertThat(undone.lockedMappings()).doesNotContainKey(replacement.left());
+        controller.close();
+    }
+
     private WorkspaceController.Workspace compare(WorkspaceController controller, Path left, Path right)
             throws Exception {
         CountDownLatch completed = new CountDownLatch(1);
@@ -115,14 +158,43 @@ class WorkspaceControllerTest {
         assertThat(failure.get()).isNull();
     }
 
+    private static WorkspaceController.Workspace awaitMapping(MappingOperation operation) throws Exception {
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<WorkspaceController.Workspace> result = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        operation.start(workspace -> {
+            result.set(workspace);
+            completed.countDown();
+        }, throwable -> {
+            failure.set(throwable);
+            completed.countDown();
+        });
+        assertThat(completed.await(15, TimeUnit.SECONDS)).isTrue();
+        assertThat(failure.get()).isNull();
+        return result.get();
+    }
+
     private Path jar(String fileName, String className, String methodName) throws Exception {
+        return jar(fileName, Map.of(className, methodName));
+    }
+
+    private Path jar(String fileName, Map<String, String> classes) throws Exception {
         Path path = temporaryDirectory.resolve(fileName);
         try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(path))) {
-            output.putNextEntry(new JarEntry(className + ".class"));
-            output.write(classBytes(className, methodName));
-            output.closeEntry();
+            for (Map.Entry<String, String> entry : new LinkedHashMap<>(classes).entrySet()) {
+                output.putNextEntry(new JarEntry(entry.getKey() + ".class"));
+                output.write(classBytes(entry.getKey(), entry.getValue()));
+                output.closeEntry();
+            }
         }
         return path;
+    }
+
+    @FunctionalInterface
+    private interface MappingOperation {
+        void start(
+                java.util.function.Consumer<WorkspaceController.Workspace> success,
+                java.util.function.Consumer<Throwable> failure);
     }
 
     private static byte[] classBytes(String className, String methodName) {

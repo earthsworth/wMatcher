@@ -15,6 +15,9 @@ import org.earthsworth.wmatcher.core.model.DiffResult;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.MatchResult;
+import org.earthsworth.wmatcher.core.model.MatchDecision;
+import org.earthsworth.wmatcher.core.model.MatchStatus;
+import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.junit.jupiter.api.Test;
 
@@ -68,10 +71,71 @@ class WorkspacePanelTest {
         controller.close();
     }
 
+    @Test
+    void showsCurrentConfirmedMappingAndRankedAlternatives() throws Exception {
+        EntityId leftId = EntityId.classId("old/Readable");
+        EntityId currentRight = EntityId.classId("new/Current");
+        EntityId alternativeRight = EntityId.classId("new/Alternative");
+        MatchDecision current = new MatchDecision(leftId, currentRight, MatchStatus.AUTO_CONFIRMED,
+                new ScoreBreakdown(1.0, Map.of("code", 1.0)));
+        MatchDecision currentOption = new MatchDecision(leftId, currentRight, MatchStatus.SUGGESTED,
+                current.score());
+        MatchDecision alternative = new MatchDecision(leftId, alternativeRight, MatchStatus.SUGGESTED,
+                new ScoreBreakdown(0.94, Map.of("code", 0.94)));
+        DiffNode node = new DiffNode("class:old/Readable", "old/Readable → new/Current",
+                EntityKind.CLASS, leftId, currentRight, java.util.Set.of(ChangeKind.RENAMED));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(current), Map.of(), Map.of(leftId, List.of(currentOption, alternative)),
+                        java.util.Set.of(), java.util.Set.of(alternativeRight)),
+                new DiffResult(List.of(node), Map.of()), Map.of(), List.of(), List.of(), null, "",
+                ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> {
+            result.panel = new WorkspacePanel(controller, workspace, ignored -> { });
+            result.panel.selectForTesting(node);
+            result.panel.setMinimapsVisible(false);
+        });
+
+        assertThat(result.panel.candidatesForTesting().getRowCount()).isEqualTo(2);
+        assertThat(result.panel.candidatesForTesting().getValueAt(0, 0).toString()).isNotBlank();
+        assertThat(result.panel.candidatesForTesting().getValueAt(0, 2)).isEqualTo("new/Current");
+        assertThat(result.panel.candidatesForTesting().getValueAt(1, 2)).isEqualTo("new/Alternative");
+        assertThat(result.panel.minimapsVisibleForTesting()).isFalse();
+        controller.close();
+    }
+
+    @Test
+    void replacementConfirmationCanAcceptOrCancelAnOccupiedTarget() {
+        EntityId source = EntityId.classId("old/Source");
+        EntityId occupant = EntityId.classId("old/Occupant");
+        java.util.concurrent.atomic.AtomicInteger prompts = new java.util.concurrent.atomic.AtomicInteger();
+
+        assertThat(WorkspacePanel.replacementAccepted(source, null, () -> {
+            prompts.incrementAndGet();
+            return false;
+        })).isTrue();
+        assertThat(prompts).hasValue(0);
+        assertThat(WorkspacePanel.replacementAccepted(source, occupant, () -> false)).isFalse();
+        assertThat(WorkspacePanel.replacementAccepted(source, occupant, () -> true)).isTrue();
+    }
+
     private static TreePath findPath(WorkspacePanel panel, String label) {
         for (int row = 0; row < panel.treeForTesting().getRowCount(); row++) {
             TreePath path = panel.treeForTesting().getPathForRow(row);
             if (path.getLastPathComponent().toString().equals(label)) {
+                return path;
+            }
+        }
+        throw new AssertionError("Tree path not found: " + label);
+    }
+
+    private static TreePath findPathContaining(WorkspacePanel panel, String label) {
+        for (int row = 0; row < panel.treeForTesting().getRowCount(); row++) {
+            TreePath path = panel.treeForTesting().getPathForRow(row);
+            if (path.getLastPathComponent().toString().contains(label)) {
                 return path;
             }
         }

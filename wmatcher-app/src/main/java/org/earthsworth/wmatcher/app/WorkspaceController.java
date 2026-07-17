@@ -213,6 +213,17 @@ public final class WorkspaceController implements AutoCloseable {
         updated.entrySet().removeIf(entry -> entry.getKey().equals(decision.left())
                 || entry.getValue().equals(decision.right()));
         updated.put(decision.left(), decision.right());
+        if (decision.left().kind() == EntityKind.CLASS) {
+            Map<EntityId, EntityId> projectedClasses = new LinkedHashMap<>();
+            current.matches().confirmed().stream()
+                    .filter(match -> match.left().kind() == EntityKind.CLASS)
+                    .forEach(match -> projectedClasses.put(match.left(), match.right()));
+            projectedClasses.entrySet().removeIf(entry -> entry.getKey().equals(decision.left())
+                    || entry.getValue().equals(decision.right()));
+            projectedClasses.put(decision.left(), decision.right());
+            updated.entrySet().removeIf(entry -> isMember(entry.getKey())
+                    && !ownersMatch(entry.getKey(), entry.getValue(), projectedClasses));
+        }
         pushAndRecompute(current.lockedMappings(), updated, success, failure);
     }
 
@@ -222,7 +233,12 @@ public final class WorkspaceController implements AutoCloseable {
             return;
         }
         Map<EntityId, EntityId> updated = new LinkedHashMap<>(current.lockedMappings());
-        updated.remove(left);
+        EntityId previousRight = updated.remove(left);
+        if (left.kind() == EntityKind.CLASS && previousRight != null) {
+            updated.entrySet().removeIf(entry -> isMember(entry.getKey())
+                    && (entry.getKey().owner().equals(left.name())
+                    || entry.getValue().owner().equals(previousRight.name())));
+        }
         pushAndRecompute(current.lockedMappings(), updated, success, failure);
     }
 
@@ -404,6 +420,17 @@ public final class WorkspaceController implements AutoCloseable {
             }
         });
         return merged;
+    }
+
+    private static boolean isMember(EntityId id) {
+        return id.kind() == EntityKind.FIELD || id.kind() == EntityKind.METHOD;
+    }
+
+    private static boolean ownersMatch(
+            EntityId left,
+            EntityId right,
+            Map<EntityId, EntityId> classMappings) {
+        return EntityId.classId(right.owner()).equals(classMappings.get(EntityId.classId(left.owner())));
     }
 
     private <T> void async(IoSupplier<T> action, Consumer<T> success, Consumer<Throwable> failure) {

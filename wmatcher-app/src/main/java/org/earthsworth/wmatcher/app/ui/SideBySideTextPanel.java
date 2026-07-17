@@ -1,6 +1,7 @@
 package org.earthsworth.wmatcher.app.ui;
 
 import com.formdev.flatlaf.FlatLaf;
+import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.GridLayout;
 import java.io.IOException;
@@ -25,15 +26,16 @@ public final class SideBySideTextPanel extends JPanel {
     private static final String LIGHT_THEME = "/org/fife/ui/rsyntaxtextarea/themes/idea.xml";
     private final RSyntaxTextArea left = textArea();
     private final RSyntaxTextArea right = textArea();
+    private final JScrollPane leftScroll = scrollPane(left);
+    private final JScrollPane rightScroll = scrollPane(right);
+    private final EditorMinimap leftMinimap = new EditorMinimap(left, leftScroll);
+    private final EditorMinimap rightMinimap = new EditorMinimap(right, rightScroll);
+    private TextDiff.LineChanges lineChanges = new TextDiff.LineChanges(Set.of(), Set.of());
 
     public SideBySideTextPanel() {
         super(new GridLayout(1, 2, 1, 0));
-        JScrollPane leftScroll = new JScrollPane(left);
-        JScrollPane rightScroll = new JScrollPane(right);
-        leftScroll.setBorder(BorderFactory.createEmptyBorder());
-        rightScroll.setBorder(BorderFactory.createEmptyBorder());
-        add(leftScroll);
-        add(rightScroll);
+        add(editorSide(leftScroll, leftMinimap));
+        add(editorSide(rightScroll, rightMinimap));
         AtomicBoolean synchronizing = new AtomicBoolean();
         leftScroll.getVerticalScrollBar().addAdjustmentListener(event -> sync(
                 leftScroll, rightScroll, synchronizing));
@@ -52,7 +54,17 @@ public final class SideBySideTextPanel extends JPanel {
         right.setText(rightText == null ? "" : rightText);
         left.setCaretPosition(0);
         right.setCaretPosition(0);
-        refreshHighlights();
+        lineChanges = TextDiff.compare(left.getText(), right.getText());
+        applyHighlights();
+        leftMinimap.setContent(left.getText(), lineChanges.leftMarkers());
+        rightMinimap.setContent(right.getText(), lineChanges.rightMarkers());
+    }
+
+    public void setMinimapVisible(boolean visible) {
+        leftMinimap.setVisible(visible);
+        rightMinimap.setVisible(visible);
+        revalidate();
+        repaint();
     }
 
     @Override
@@ -60,7 +72,11 @@ public final class SideBySideTextPanel extends JPanel {
         super.updateUI();
         if (left != null && right != null) {
             applyEditorTheme();
-            refreshHighlights();
+            applyHighlights();
+            if (leftMinimap != null && rightMinimap != null) {
+                leftMinimap.repaint();
+                rightMinimap.repaint();
+            }
         }
     }
 
@@ -70,6 +86,14 @@ public final class SideBySideTextPanel extends JPanel {
 
     RSyntaxTextArea rightArea() {
         return right;
+    }
+
+    EditorMinimap leftMinimapForTesting() {
+        return leftMinimap;
+    }
+
+    EditorMinimap rightMinimapForTesting() {
+        return rightMinimap;
     }
 
     private void applyEditorTheme() {
@@ -89,12 +113,11 @@ public final class SideBySideTextPanel extends JPanel {
         }
     }
 
-    private void refreshHighlights() {
+    private void applyHighlights() {
         left.getHighlighter().removeAllHighlights();
         right.getHighlighter().removeAllHighlights();
-        TextDiff.LineChanges changes = TextDiff.compare(left.getText(), right.getText());
-        highlight(left, changes.leftLines());
-        highlight(right, changes.rightLines());
+        highlight(left, lineChanges.leftLines());
+        highlight(right, lineChanges.rightLines());
     }
 
     public void setLoading(String message) {
@@ -109,6 +132,19 @@ public final class SideBySideTextPanel extends JPanel {
         area.setSyntaxEditingStyle(SyntaxConstants.SYNTAX_STYLE_NONE);
         area.setFont(new java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, 13));
         return area;
+    }
+
+    private static JScrollPane scrollPane(RSyntaxTextArea area) {
+        JScrollPane scrollPane = new JScrollPane(area);
+        scrollPane.setBorder(BorderFactory.createEmptyBorder());
+        return scrollPane;
+    }
+
+    private static JPanel editorSide(JScrollPane scrollPane, EditorMinimap minimap) {
+        JPanel side = new JPanel(new BorderLayout());
+        side.add(scrollPane, BorderLayout.CENTER);
+        side.add(minimap, BorderLayout.EAST);
+        return side;
     }
 
     private static void highlight(RSyntaxTextArea area, Set<Integer> lines) {

@@ -39,6 +39,33 @@ class SideBySideTextPanelThemeTest {
         assertThat(panel.rightArea().getText()).isEqualTo("same\nnew");
         assertThat(panel.leftArea().getHighlighter().getHighlights()).isNotEmpty();
         assertThat(panel.rightArea().getHighlighter().getHighlights()).isNotEmpty();
+        assertThat(panel.leftMinimapForTesting().markerBinCountForTesting()).isPositive();
+        assertThat(panel.rightMinimapForTesting().markerBinCountForTesting()).isPositive();
+    }
+
+    @Test
+    void boundsLongDocumentsAndNavigatesThroughTheScrollModel() throws Exception {
+        AtomicReference<SideBySideTextPanel> panelReference = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            SideBySideTextPanel panel = new SideBySideTextPanel();
+            String common = java.util.stream.IntStream.range(0, 5_000)
+                    .mapToObj(index -> "line " + index)
+                    .collect(java.util.stream.Collectors.joining("\n"));
+            panel.setTexts(common + "\nold", common + "\nnew");
+            EditorMinimap minimap = panel.leftMinimapForTesting();
+            minimap.setSize(EditorMinimap.MINIMAP_WIDTH, 400);
+            minimap.setScrollRangeForTesting(0, 100, 1_000);
+            minimap.navigateForTesting(399);
+            panelReference.set(panel);
+        });
+
+        SideBySideTextPanel panel = panelReference.get();
+        assertThat(panel.leftMinimapForTesting().binCountForTesting()).isEqualTo(2_048);
+        assertThat(panel.leftMinimapForTesting().scrollValueForTesting()).isGreaterThan(800);
+
+        SwingUtilities.invokeAndWait(() -> panel.setMinimapVisible(false));
+        assertThat(panel.leftMinimapForTesting().isVisible()).isFalse();
+        assertThat(panel.rightMinimapForTesting().isVisible()).isFalse();
     }
 
     private static int luminance(Color color) {

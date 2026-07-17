@@ -46,4 +46,13 @@ class AppPreferencesTest {
         assertThat(preferences.get("recentProject", "")).isEmpty();
         assertThat(AppPreferences.readRecentProjects(preferences)).isEmpty();
     }
+
+    @Test
+    void keepsMinimapVisibleByDefaultAndPersistsTheToggle() {
+        assertThat(AppPreferences.minimapVisible(preferences)).isTrue();
+
+        AppPreferences.setMinimapVisible(preferences, false);
+
+        assertThat(AppPreferences.minimapVisible(preferences)).isFalse();
+    }
 }

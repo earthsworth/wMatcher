@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.Locale;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -94,6 +95,17 @@ public final class MainFrame extends JFrame {
         view.add(item(text("menu.themeSystem"), () -> WMatcherApplication.installTheme("system")));
         view.add(item(text("menu.themeLight"), () -> WMatcherApplication.installTheme("light")));
         view.add(item(text("menu.themeDark"), () -> WMatcherApplication.installTheme("dark")));
+        view.addSeparator();
+        JCheckBoxMenuItem showMinimap = new JCheckBoxMenuItem(text("menu.showMinimap"),
+                AppPreferences.minimapVisible());
+        showMinimap.addActionListener(event -> {
+            boolean visible = showMinimap.isSelected();
+            AppPreferences.setMinimapVisible(visible);
+            if (workspacePanel != null) {
+                workspacePanel.setMinimapsVisible(visible);
+            }
+        });
+        view.add(showMinimap);
         JMenu language = new JMenu(text("menu.language"));
         language.add(item(text("menu.english"), () -> setLanguage(Locale.ENGLISH)));
         language.add(item(text("menu.chinese"), () -> setLanguage(Locale.SIMPLIFIED_CHINESE)));
@@ -161,6 +173,7 @@ public final class MainFrame extends JFrame {
             content.remove(workspacePanel);
         }
         workspacePanel = new WorkspacePanel(controller, workspace, this::showError);
+        workspacePanel.setMinimapsVisible(AppPreferences.minimapVisible());
         content.add(workspacePanel, WORKSPACE);
         cards.show(content, WORKSPACE);
         status.setText(workspace.warning().isBlank() ? text("status.ready") : workspace.warning());
