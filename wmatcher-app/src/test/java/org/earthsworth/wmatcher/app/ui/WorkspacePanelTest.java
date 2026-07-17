@@ -67,7 +67,7 @@ class WorkspacePanelTest {
         assertThat(SwingUtilities.isDescendingFrom(
                 result.panel.searchForTesting(), result.panel.splitForTesting().getLeftComponent())).isTrue();
         assertThat(result.panel.uiState().expandedTreeKeys())
-                .contains("package:classes:sample", "package:classes:sample/deep");
+                .contains("package:*:classes:sample", "package:*:classes:sample/deep");
         controller.close();
     }
 
@@ -120,6 +120,67 @@ class WorkspacePanelTest {
         assertThat(prompts).hasValue(0);
         assertThat(WorkspacePanel.replacementAccepted(source, occupant, () -> false)).isFalse();
         assertThat(WorkspacePanel.replacementAccepted(source, occupant, () -> true)).isTrue();
+    }
+
+    @Test
+    void groupsEntitiesByChangedUnmatchedAndUnchangedStatus() throws Exception {
+        EntityId leftClass = EntityId.classId("old/Changed");
+        EntityId rightClass = EntityId.classId("new/Changed");
+        DiffNode changed = new DiffNode("class:changed", "changed", EntityKind.CLASS,
+                leftClass, rightClass, java.util.Set.of(ChangeKind.STRUCTURE));
+        DiffNode unmatchedMethod = new DiffNode("method:unmatched", "old/Changed.missing()V",
+                EntityKind.METHOD, EntityId.methodId("old/Changed", "missing", "()V"), null,
+                java.util.Set.of(ChangeKind.REMOVED));
+        DiffNode unchanged = new DiffNode("resource:stable.txt", "stable.txt", EntityKind.RESOURCE,
+                EntityId.resourceId("stable.txt"), EntityId.resourceId("stable.txt"), java.util.Set.of());
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(), java.util.Set.of()),
+                new DiffResult(List.of(changed, unmatchedMethod, unchanged), Map.of()),
+                Map.of(), List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.rootKeysForTesting()).containsExactly(
+                "status:changed", "status:unmatched", "status:unchanged");
+        assertThat(result.panel.stableTreeKeysForTesting())
+                .contains("status:changed:classes", "status:unmatched:classes", "status:unchanged:resources")
+                .anyMatch(key -> key.startsWith("owner:unmatched:L:old/Changed"));
+        controller.close();
+    }
+
+    @Test
+    void sendsMembersFromNonDetailTabsToSourceAndPreservesCurrentDetailTab() {
+        assertThat(WorkspacePanel.detailTabForSelection(EntityKind.METHOD, 0)).isEqualTo(4);
+        assertThat(WorkspacePanel.detailTabForSelection(EntityKind.FIELD, 1)).isEqualTo(4);
+        assertThat(WorkspacePanel.detailTabForSelection(EntityKind.METHOD, 2)).isEqualTo(2);
+        assertThat(WorkspacePanel.detailTabForSelection(EntityKind.FIELD, 3)).isEqualTo(3);
+        assertThat(WorkspacePanel.detailTabForSelection(EntityKind.CLASS, 0)).isZero();
+    }
+
+    @Test
+    void migratesLegacyExpandedTreeKeysToStatusAwareKeys() throws Exception {
+        EntityId leftId = EntityId.classId("sample/deep/Legacy");
+        DiffNode node = new DiffNode("class:legacy", "sample/deep/Legacy", EntityKind.CLASS,
+                leftId, null, java.util.Set.of(ChangeKind.UNRESOLVED));
+        ProjectUiState legacyState = new ProjectUiState("", java.util.Set.of(), "",
+                java.util.Set.of("root:classes", "package:classes:sample", "package:classes:sample/deep"),
+                0, 340);
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(leftId), java.util.Set.of()),
+                new DiffResult(List.of(node), Map.of()), Map.of(), List.of(), List.of(), null, "", legacyState);
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.uiState().expandedTreeKeys())
+                .contains("status:changed:classes", "status:unmatched:classes", "status:unchanged:classes",
+                        "package:*:classes:sample", "package:*:classes:sample/deep");
+        controller.close();
     }
 
     private static TreePath findPath(WorkspacePanel panel, String label) {

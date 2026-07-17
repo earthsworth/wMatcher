@@ -301,12 +301,13 @@ public final class WorkspaceController implements AutoCloseable {
             DiffNode node, boolean leftSide, boolean semantic, Consumer<String> success, Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
         EntityId id = leftSide ? node.left() : node.right();
-        if (id == null || id.kind() != EntityKind.CLASS) {
+        if (id == null || id.kind() == EntityKind.RESOURCE) {
             success.accept("");
             return;
         }
         ArtifactSnapshot artifact = leftSide ? current.left() : current.right();
-        async(() -> inspector.bytecodeText(artifact, id.name(), semantic), success, failure);
+        String className = id.kind() == EntityKind.CLASS ? id.name() : id.owner();
+        async(() -> inspector.bytecodeText(artifact, className, semantic), success, failure);
     }
 
     public void loadResource(
@@ -325,7 +326,7 @@ public final class WorkspaceController implements AutoCloseable {
             DiffNode node, boolean leftSide, boolean canonical, Consumer<String> success, Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
         EntityId id = leftSide ? node.left() : node.right();
-        if (id == null || id.kind() != EntityKind.CLASS) {
+        if (id == null || id.kind() == EntityKind.RESOURCE) {
             success.accept("");
             return;
         }
@@ -334,7 +335,7 @@ public final class WorkspaceController implements AutoCloseable {
         libraries.add(leftSide ? current.right().path() : current.left().path());
         DecompileRequest request = new DecompileRequest(
                 artifact,
-                id.name(),
+                id.kind() == EntityKind.CLASS ? id.name() : id.owner(),
                 current.matches().confirmedMappings(),
                 canonical && !leftSide,
                 libraries);

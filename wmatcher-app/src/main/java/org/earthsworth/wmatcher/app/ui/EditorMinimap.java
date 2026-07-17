@@ -21,6 +21,9 @@ import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
 
 final class EditorMinimap extends JComponent {
     static final int MINIMAP_WIDTH = 80;
+    static final int DIFF_RAIL_WIDTH = 8;
+    static final int DIFF_MARKER_HEIGHT = 4;
+    static final int DIFF_ANCHOR_HEIGHT = 6;
     private static final int MAXIMUM_BINS = 2048;
     private final RSyntaxTextArea editor;
     private final JScrollBar verticalScrollBar;
@@ -109,9 +112,13 @@ final class EditorMinimap extends JComponent {
                     copy.drawLine(start, y, Math.min(getWidth() - 5, start + length), y);
                 }
                 if (rowMarker != 0) {
-                    copy.setColor(markerColor(rowMarker));
-                    int markerHeight = rowAnchor ? 2 : 1;
-                    copy.fillRect(getWidth() - 4, y, 4, markerHeight);
+                    Color marker = markerColor(rowMarker);
+                    int markerHeight = rowAnchor ? DIFF_ANCHOR_HEIGHT : DIFF_MARKER_HEIGHT;
+                    int markerY = Math.max(0, y - markerHeight / 2);
+                    copy.setColor(withAlpha(marker, FlatLaf.isLafDark() ? 62 : 48));
+                    copy.fillRect(0, markerY, Math.max(0, getWidth() - DIFF_RAIL_WIDTH), markerHeight);
+                    copy.setColor(marker);
+                    copy.fillRect(getWidth() - DIFF_RAIL_WIDTH, markerY, DIFF_RAIL_WIDTH, markerHeight);
                 }
             }
             paintViewport(copy, height);
@@ -133,9 +140,10 @@ final class EditorMinimap extends JComponent {
             accent = new Color(90, 140, 220);
         }
         graphics.setColor(withAlpha(accent, FlatLaf.isLafDark() ? 58 : 44));
-        graphics.fillRect(0, top, getWidth() - 4, viewportHeight);
+        graphics.fillRect(0, top, getWidth() - DIFF_RAIL_WIDTH, viewportHeight);
         graphics.setColor(withAlpha(accent, 150));
-        graphics.drawRect(0, top, Math.max(0, getWidth() - 5), Math.max(0, viewportHeight - 1));
+        graphics.drawRect(0, top, Math.max(0, getWidth() - DIFF_RAIL_WIDTH - 1),
+                Math.max(0, viewportHeight - 1));
     }
 
     private void navigate(int y) {

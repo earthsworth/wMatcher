@@ -10,6 +10,7 @@ import java.awt.Font;
 import java.awt.GridLayout;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -60,6 +61,9 @@ import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
 
 public final class WorkspacePanel extends JPanel {
+    private static final int STRUCTURE_TAB = 2;
+    private static final int BYTECODE_TAB = 3;
+    private static final int SOURCE_TAB = 4;
     private final WorkspaceController controller;
     private final Consumer<Throwable> errorHandler;
     private WorkspaceController.Workspace workspace;
@@ -167,14 +171,16 @@ public final class WorkspacePanel extends JPanel {
             @Override
             public void treeExpanded(TreeExpansionEvent event) {
                 if (!restoringTreeState) {
-                    treeEntry(event.getPath()).ifPresent(entry -> expandedTreeKeys.add(entry.stableKey()));
+                    treeEntry(event.getPath()).ifPresent(entry -> expandedTreeKeys.add(
+                            expansionStateKey(entry.stableKey())));
                 }
             }
 
             @Override
             public void treeCollapsed(TreeExpansionEvent event) {
                 if (!restoringTreeState) {
-                    treeEntry(event.getPath()).ifPresent(entry -> expandedTreeKeys.remove(entry.stableKey()));
+                    treeEntry(event.getPath()).ifPresent(entry -> expandedTreeKeys.remove(
+                            expansionStateKey(entry.stableKey())));
                 }
             }
         });
@@ -214,7 +220,9 @@ public final class WorkspacePanel extends JPanel {
             loadSource();
         });
         tabs.addChangeListener(event -> {
-            if (tabs.getSelectedIndex() == 4) {
+            if (tabs.getSelectedIndex() == BYTECODE_TAB) {
+                loadBytecode();
+            } else if (tabs.getSelectedIndex() == SOURCE_TAB) {
                 loadSource();
             }
         });
@@ -239,7 +247,7 @@ public final class WorkspacePanel extends JPanel {
 
     private void applyUiState(ProjectUiState state) {
         expandedTreeKeys.clear();
-        expandedTreeKeys.addAll(state.expandedTreeKeys());
+        expandedTreeKeys.addAll(migrateExpandedTreeKeys(state.expandedTreeKeys()));
         restoredScrollPosition = state.treeScrollPosition();
         workspaceSplit.setDividerLocation(state.navigationDividerLocation());
         search.setText(state.search());
@@ -283,52 +291,20 @@ public final class WorkspacePanel extends JPanel {
             effectiveScroll = restoredScrollPosition;
             restoredScrollPosition = 0;
         }
-        DefaultMutableTreeNode classRoot = new DefaultMutableTreeNode(
-                new TreeEntry("root:classes", text("tree.classes"), null));
-        DefaultMutableTreeNode resourceRoot = new DefaultMutableTreeNode(
-                new TreeEntry("root:resources", text("tree.resources"), null));
-        root.add(classRoot);
-        root.add(resourceRoot);
-        Map<String, DefaultMutableTreeNode> packages = new HashMap<>();
-        Map<String, DefaultMutableTreeNode> classNodes = new HashMap<>();
         List<DiffNode> visible = workspace.differences().nodes().stream()
                 .filter(this::visible)
                 .toList();
-        visible.stream().filter(node -> node.kind() == EntityKind.CLASS).forEach(node -> {
-            String className = entityName(node);
-            int slash = className.lastIndexOf('/');
-            String packageName = slash < 0 ? "" : className.substring(0, slash);
-            String simpleName = slash < 0 ? className : className.substring(slash + 1);
-            DefaultMutableTreeNode parent = packageNode(classRoot, packages, "classes", packageName);
-            DefaultMutableTreeNode classNode = new DefaultMutableTreeNode(
-                    new TreeEntry(stableNodeKey(node), label(simpleName, node), node));
-            parent.add(classNode);
-            if (node.left() != null) {
-                classNodes.put(node.left().name(), classNode);
+        Map<TreeStatus, List<DiffNode>> statusGroups = new EnumMap<>(TreeStatus.class);
+        for (TreeStatus status : TreeStatus.values()) {
+            statusGroups.put(status, new ArrayList<>());
+        }
+        visible.forEach(node -> statusGroups.get(treeStatus(node)).add(node));
+        for (TreeStatus status : TreeStatus.values()) {
+            List<DiffNode> nodes = statusGroups.get(status);
+            if (!nodes.isEmpty()) {
+                addStatusGroup(root, status, nodes);
             }
-            if (node.right() != null) {
-                classNodes.put(node.right().name(), classNode);
-            }
-        });
-        visible.stream().filter(node -> node.kind() == EntityKind.FIELD || node.kind() == EntityKind.METHOD)
-                .forEach(node -> {
-                    EntityId id = node.left() != null ? node.left() : node.right();
-                    DefaultMutableTreeNode parent = classNodes.get(id.owner());
-                    if (parent != null) {
-                        parent.add(new DefaultMutableTreeNode(new TreeEntry(
-                                stableNodeKey(node), label(id.name() + id.descriptor(), node), node)));
-                    }
-                });
-        Map<String, DefaultMutableTreeNode> resourceDirectories = new HashMap<>();
-        visible.stream().filter(node -> node.kind() == EntityKind.RESOURCE).forEach(node -> {
-            String name = entityName(node);
-            int slash = name.lastIndexOf('/');
-            String directory = slash < 0 ? "" : name.substring(0, slash);
-            String simple = slash < 0 ? name : name.substring(slash + 1);
-            DefaultMutableTreeNode parent = packageNode(resourceRoot, resourceDirectories, "resources", directory);
-            parent.add(new DefaultMutableTreeNode(
-                    new TreeEntry(stableNodeKey(node), label(simple, node), node)));
-        });
+        }
         restoringTreeState = true;
         try {
             tree.setModel(new DefaultTreeModel(root));
@@ -347,6 +323,110 @@ public final class WorkspacePanel extends JPanel {
         SwingUtilities.invokeLater(() -> treeScrollPane.getVerticalScrollBar().setValue(scrollToRestore));
     }
 
+    private void addStatusGroup(DefaultMutableTreeNode root, TreeStatus status, List<DiffNode> nodes) {
+        DefaultMutableTreeNode statusRoot = new DefaultMutableTreeNode(new TreeEntry(
+                "status:" + status.key(), text(status.messageKey()) + " (" + nodes.size() + ')', null));
+        root.add(statusRoot);
+        List<DiffNode> classEntities = nodes.stream()
+                .filter(node -> node.kind() == EntityKind.CLASS
+                        || node.kind() == EntityKind.FIELD
+                        || node.kind() == EntityKind.METHOD)
+                .toList();
+        if (!classEntities.isEmpty()) {
+            DefaultMutableTreeNode classRoot = new DefaultMutableTreeNode(new TreeEntry(
+                    "status:" + status.key() + ":classes", text("tree.classes"), null));
+            statusRoot.add(classRoot);
+            addClassEntities(status, classRoot, classEntities);
+        }
+        List<DiffNode> resources = nodes.stream()
+                .filter(node -> node.kind() == EntityKind.RESOURCE)
+                .toList();
+        if (!resources.isEmpty()) {
+            DefaultMutableTreeNode resourceRoot = new DefaultMutableTreeNode(new TreeEntry(
+                    "status:" + status.key() + ":resources", text("tree.resources"), null));
+            statusRoot.add(resourceRoot);
+            addResources(status, resourceRoot, resources);
+        }
+    }
+
+    private void addClassEntities(
+            TreeStatus status,
+            DefaultMutableTreeNode classRoot,
+            List<DiffNode> nodes) {
+        Map<String, DefaultMutableTreeNode> packages = new HashMap<>();
+        Map<String, DefaultMutableTreeNode> classNodes = new HashMap<>();
+        nodes.stream().filter(node -> node.kind() == EntityKind.CLASS).forEach(node -> {
+            String className = entityName(node);
+            int slash = className.lastIndexOf('/');
+            String packageName = slash < 0 ? "" : className.substring(0, slash);
+            String simpleName = slash < 0 ? className : className.substring(slash + 1);
+            DefaultMutableTreeNode parent = packageNode(classRoot, packages,
+                    status.key() + ":classes", packageName);
+            DefaultMutableTreeNode classNode = new DefaultMutableTreeNode(
+                    new TreeEntry(stableNodeKey(node), label(simpleName, node), node));
+            parent.add(classNode);
+            if (node.left() != null) {
+                classNodes.put(node.left().name(), classNode);
+            }
+            if (node.right() != null) {
+                classNodes.put(node.right().name(), classNode);
+            }
+        });
+        nodes.stream().filter(node -> node.kind() == EntityKind.FIELD || node.kind() == EntityKind.METHOD)
+                .forEach(node -> {
+                    EntityId id = node.left() != null ? node.left() : node.right();
+                    DefaultMutableTreeNode parent = classNodes.get(id.owner());
+                    if (parent == null) {
+                        parent = syntheticOwnerNode(status, classRoot, packages, classNodes, node);
+                    }
+                    parent.add(new DefaultMutableTreeNode(new TreeEntry(
+                            stableNodeKey(node), label(id.name() + id.descriptor(), node), node)));
+                });
+    }
+
+    private static DefaultMutableTreeNode syntheticOwnerNode(
+            TreeStatus status,
+            DefaultMutableTreeNode classRoot,
+            Map<String, DefaultMutableTreeNode> packages,
+            Map<String, DefaultMutableTreeNode> classNodes,
+            DiffNode member) {
+        EntityId primary = member.left() != null ? member.left() : member.right();
+        String owner = primary.owner();
+        int slash = owner.lastIndexOf('/');
+        String packageName = slash < 0 ? "" : owner.substring(0, slash);
+        String simpleName = slash < 0 ? owner : owner.substring(slash + 1);
+        DefaultMutableTreeNode packageNode = packageNode(classRoot, packages,
+                status.key() + ":classes", packageName);
+        String side = member.left() != null ? "L:" : "R:";
+        DefaultMutableTreeNode ownerNode = new DefaultMutableTreeNode(new TreeEntry(
+                "owner:" + status.key() + ':' + side + owner, simpleName, null));
+        packageNode.add(ownerNode);
+        if (member.left() != null) {
+            classNodes.put(member.left().owner(), ownerNode);
+        }
+        if (member.right() != null) {
+            classNodes.put(member.right().owner(), ownerNode);
+        }
+        return ownerNode;
+    }
+
+    private static void addResources(
+            TreeStatus status,
+            DefaultMutableTreeNode resourceRoot,
+            List<DiffNode> resources) {
+        Map<String, DefaultMutableTreeNode> resourceDirectories = new HashMap<>();
+        resources.forEach(node -> {
+            String name = entityName(node);
+            int slash = name.lastIndexOf('/');
+            String directory = slash < 0 ? "" : name.substring(0, slash);
+            String simple = slash < 0 ? name : name.substring(slash + 1);
+            DefaultMutableTreeNode parent = packageNode(resourceRoot, resourceDirectories,
+                    status.key() + ":resources", directory);
+            parent.add(new DefaultMutableTreeNode(
+                    new TreeEntry(stableNodeKey(node), label(simple, node), node)));
+        });
+    }
+
     private boolean visible(DiffNode node) {
         String query = search.getText().trim().toLowerCase(Locale.ROOT);
         if (!query.isEmpty() && !node.displayName().toLowerCase(Locale.ROOT).contains(query)) {
@@ -356,14 +436,24 @@ public final class WorkspacePanel extends JPanel {
         FilterKind kind = option == null ? FilterKind.ALL : option.kind();
         return switch (kind) {
             case ALL -> true;
-            case CHANGED -> node.changed();
+            case CHANGED -> treeStatus(node) == TreeStatus.CHANGED;
             case ADDED -> node.changes().contains(ChangeKind.ADDED);
             case REMOVED -> node.changes().contains(ChangeKind.REMOVED);
-            case MODIFIED -> node.changes().contains(ChangeKind.STRUCTURE)
-                    || node.changes().contains(ChangeKind.CODE) || node.changes().contains(ChangeKind.RESOURCE)
-                    || node.changes().contains(ChangeKind.RENAMED) || node.changes().contains(ChangeKind.MOVED);
+            case MODIFIED -> treeStatus(node) == TreeStatus.CHANGED;
             case UNRESOLVED -> node.changes().contains(ChangeKind.UNRESOLVED);
         };
+    }
+
+    private static TreeStatus treeStatus(DiffNode node) {
+        if (node.left() == null || node.right() == null || node.changes().contains(ChangeKind.UNRESOLVED)) {
+            return TreeStatus.UNMATCHED;
+        }
+        return node.changed() ? TreeStatus.CHANGED : TreeStatus.UNCHANGED;
+    }
+
+    static int detailTabForSelection(EntityKind kind, int activeTab) {
+        boolean member = kind == EntityKind.FIELD || kind == EntityKind.METHOD;
+        return member && (activeTab < STRUCTURE_TAB || activeTab > SOURCE_TAB) ? SOURCE_TAB : activeTab;
     }
 
     private void selectNode(DiffNode node) {
@@ -378,11 +468,21 @@ public final class WorkspacePanel extends JPanel {
             String leftClass = leftId == null ? null : leftId.kind() == EntityKind.CLASS ? leftId.name() : leftId.owner();
             String rightClass = rightId == null ? null : rightId.kind() == EntityKind.CLASS ? rightId.name() : rightId.owner();
             structure.setTexts(formatClass(workspace.left().classes().get(leftClass)),
-                    formatClass(workspace.right().classes().get(rightClass)));
-            loadBytecode();
-            source.setTexts(text("detail.select"), text("detail.select"));
-            if (tabs.getSelectedIndex() == 4) {
+                    formatClass(workspace.right().classes().get(rightClass)),
+                    MemberTextLocator.structure(leftId), MemberTextLocator.structure(rightId));
+            int activeTab = tabs.getSelectedIndex();
+            boolean member = node.kind() == EntityKind.FIELD || node.kind() == EntityKind.METHOD;
+            int targetTab = detailTabForSelection(node.kind(), activeTab);
+            if (targetTab != activeTab) {
+                source.setLoading(text("detail.loading"));
+                tabs.setSelectedIndex(targetTab);
+            } else if (activeTab == BYTECODE_TAB) {
+                loadBytecode();
+            } else if (activeTab == SOURCE_TAB) {
                 loadSource();
+            } else if (!member) {
+                loadBytecode();
+                source.setTexts(text("detail.select"), text("detail.select"));
             }
         } else if (node.kind() == EntityKind.RESOURCE) {
             structure.setLoading(text("detail.loading"));
@@ -398,7 +498,7 @@ public final class WorkspacePanel extends JPanel {
 
     private void loadBytecode() {
         DiffNode node = selected;
-        if (node == null || node.kind() != EntityKind.CLASS) {
+        if (node == null || node.kind() == EntityKind.RESOURCE) {
             bytecode.setTexts("", "");
             return;
         }
@@ -408,12 +508,14 @@ public final class WorkspacePanel extends JPanel {
                 callback -> controller.loadBytecode(node, true, semantic.isSelected(), callback, errorHandler),
                 callback -> controller.loadBytecode(node, false, semantic.isSelected(), callback, errorHandler),
                 bytecode,
-                requestGeneration);
+                requestGeneration,
+                MemberTextLocator.bytecode(node.left()),
+                MemberTextLocator.bytecode(node.right()));
     }
 
     private void loadSource() {
         DiffNode node = selected;
-        if (node == null || node.kind() != EntityKind.CLASS || sourceGeneration == generation) {
+        if (node == null || node.kind() == EntityKind.RESOURCE || sourceGeneration == generation) {
             return;
         }
         sourceGeneration = generation;
@@ -423,7 +525,17 @@ public final class WorkspacePanel extends JPanel {
                 callback -> controller.loadSource(node, true, canonical.isSelected(), callback, errorHandler),
                 callback -> controller.loadSource(node, false, canonical.isSelected(), callback, errorHandler),
                 source,
-                requestGeneration);
+                requestGeneration,
+                sourceLocator(node, true),
+                sourceLocator(node, false));
+    }
+
+    private TextLocator sourceLocator(DiffNode node, boolean leftSide) {
+        EntityId id = leftSide ? node.left() : node.right();
+        if (!leftSide && canonical.isSelected() && node.left() != null && node.right() != null) {
+            id = node.left();
+        }
+        return MemberTextLocator.source(id);
     }
 
     private void loadPair(
@@ -431,12 +543,22 @@ public final class WorkspacePanel extends JPanel {
             Consumer<Consumer<String>> rightLoader,
             SideBySideTextPanel target,
             long requestGeneration) {
+        loadPair(leftLoader, rightLoader, target, requestGeneration, null, null);
+    }
+
+    private void loadPair(
+            Consumer<Consumer<String>> leftLoader,
+            Consumer<Consumer<String>> rightLoader,
+            SideBySideTextPanel target,
+            long requestGeneration,
+            TextLocator leftLocator,
+            TextLocator rightLocator) {
         AtomicReference<String> leftText = new AtomicReference<>("");
         AtomicReference<String> rightText = new AtomicReference<>("");
         AtomicInteger completed = new AtomicInteger();
         Runnable render = () -> {
             if (completed.incrementAndGet() == 2 && generation == requestGeneration) {
-                target.setTexts(leftText.get(), rightText.get());
+                target.setTexts(leftText.get(), rightText.get(), leftLocator, rightLocator);
             }
         };
         leftLoader.accept(value -> {
@@ -708,13 +830,66 @@ public final class WorkspacePanel extends JPanel {
 
     private void restoreExpandedPaths(DefaultMutableTreeNode node) {
         Object user = node.getUserObject();
-        if (user instanceof TreeEntry entry && expandedTreeKeys.contains(entry.stableKey())) {
+        if (user instanceof TreeEntry entry
+                && expandedTreeKeys.contains(expansionStateKey(entry.stableKey()))) {
             tree.expandPath(new TreePath(node.getPath()));
         }
         Enumeration<?> children = node.children();
         while (children.hasMoreElements()) {
             restoreExpandedPaths((DefaultMutableTreeNode) children.nextElement());
         }
+    }
+
+    private static Set<String> migrateExpandedTreeKeys(Set<String> stored) {
+        Set<String> migrated = new LinkedHashSet<>();
+        for (String key : stored) {
+            if (key.equals("root:classes")) {
+                for (TreeStatus status : TreeStatus.values()) {
+                    migrated.add("status:" + status.key());
+                    migrated.add("status:" + status.key() + ":classes");
+                }
+            } else if (key.equals("root:resources")) {
+                for (TreeStatus status : TreeStatus.values()) {
+                    migrated.add("status:" + status.key());
+                    migrated.add("status:" + status.key() + ":resources");
+                }
+            } else if (key.startsWith("package:classes:")) {
+                String path = key.substring("package:classes:".length());
+                migrated.add("package:*:classes:" + path);
+            } else if (key.startsWith("package:resources:")) {
+                String path = key.substring("package:resources:".length());
+                migrated.add("package:*:resources:" + path);
+            } else {
+                migrated.add(expansionStateKey(key));
+            }
+        }
+        return migrated;
+    }
+
+    private static String expansionStateKey(String stableKey) {
+        if (stableKey.startsWith("entity:L:CLASS:")) {
+            return "owner:*:L:" + stableKey.substring("entity:L:CLASS:".length());
+        }
+        if (stableKey.startsWith("entity:R:CLASS:")) {
+            return "owner:*:R:" + stableKey.substring("entity:R:CLASS:".length());
+        }
+        if (stableKey.startsWith("package:")) {
+            String[] parts = stableKey.split(":", 4);
+            if (parts.length == 4 && isStatusKey(parts[1])) {
+                return "package:*:" + parts[2] + ':' + parts[3];
+            }
+        }
+        if (stableKey.startsWith("owner:")) {
+            String[] parts = stableKey.split(":", 4);
+            if (parts.length == 4 && isStatusKey(parts[1])) {
+                return "owner:*:" + parts[2] + ':' + parts[3];
+            }
+        }
+        return stableKey;
+    }
+
+    private static boolean isStatusKey(String value) {
+        return value.equals("changed") || value.equals("unmatched") || value.equals("unchanged");
     }
 
     private static java.util.Optional<TreeEntry> treeEntry(TreePath path) {
@@ -756,6 +931,46 @@ public final class WorkspacePanel extends JPanel {
     void selectForTesting(DiffNode node) {
         selected = node;
         updateCandidates(node);
+    }
+
+    List<String> rootKeysForTesting() {
+        DefaultMutableTreeNode root = (DefaultMutableTreeNode) tree.getModel().getRoot();
+        List<String> keys = new ArrayList<>();
+        for (int index = 0; index < root.getChildCount(); index++) {
+            DefaultMutableTreeNode child = (DefaultMutableTreeNode) root.getChildAt(index);
+            if (child.getUserObject() instanceof TreeEntry entry) keys.add(entry.stableKey());
+        }
+        return keys;
+    }
+
+    List<String> stableTreeKeysForTesting() {
+        List<String> keys = new ArrayList<>();
+        collectStableKeys((DefaultMutableTreeNode) tree.getModel().getRoot(), keys);
+        return keys;
+    }
+
+    private static void collectStableKeys(DefaultMutableTreeNode node, List<String> target) {
+        if (node.getUserObject() instanceof TreeEntry entry) target.add(entry.stableKey());
+        for (int index = 0; index < node.getChildCount(); index++) {
+            collectStableKeys((DefaultMutableTreeNode) node.getChildAt(index), target);
+        }
+    }
+
+    private enum TreeStatus {
+        CHANGED("changed", "tree.changed"),
+        UNMATCHED("unmatched", "tree.unmatched"),
+        UNCHANGED("unchanged", "tree.unchanged");
+
+        private final String key;
+        private final String messageKey;
+
+        TreeStatus(String key, String messageKey) {
+            this.key = key;
+            this.messageKey = messageKey;
+        }
+
+        String key() { return key; }
+        String messageKey() { return messageKey; }
     }
 
     private enum FilterKind { ALL, CHANGED, ADDED, REMOVED, MODIFIED, UNRESOLVED }

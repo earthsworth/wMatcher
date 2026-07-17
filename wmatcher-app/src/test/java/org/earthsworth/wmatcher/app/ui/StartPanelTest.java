@@ -36,4 +36,24 @@ class StartPanelTest {
         assertThat(opened).hasValue(existing.toAbsolutePath().normalize());
         assertThat(removed).hasValue(missing.toAbsolutePath().normalize());
     }
+
+    @Test
+    void visibleRemoveButtonOnlyRemovesTheRecentEntry() throws Exception {
+        Path project = Files.createFile(temporaryDirectory.resolve("kept.wmatch"));
+        AtomicReference<Path> removed = new AtomicReference<>();
+        AtomicReference<StartPanel> panelReference = new AtomicReference<>();
+
+        SwingUtilities.invokeAndWait(() -> {
+            StartPanel panel = new StartPanel(() -> { }, () -> { }, ignored -> { }, removed::set,
+                    List.of(new AppPreferences.RecentProject(project, 1)));
+            panelReference.set(panel);
+            assertThat(panel.removeRecentButtonForTesting().isEnabled()).isTrue();
+            panel.removeRecentButtonForTesting().doClick();
+        });
+
+        assertThat(removed).hasValue(project.toAbsolutePath().normalize());
+        assertThat(project).exists();
+        assertThat(panelReference.get().recentListForTesting().getModel().getSize()).isZero();
+        assertThat(panelReference.get().removeRecentButtonForTesting().isEnabled()).isFalse();
+    }
 }

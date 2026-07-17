@@ -10,7 +10,13 @@ public record ProjectUiState(
         int treeScrollPosition,
         int navigationDividerLocation) {
     private static final int DEFAULT_DIVIDER_LOCATION = 340;
-    private static final Set<String> DEFAULT_EXPANDED_TREE_KEYS = Set.of("root:classes", "root:resources");
+    private static final Set<String> DEFAULT_EXPANDED_TREE_KEYS = Set.of(
+            "status:changed",
+            "status:changed:classes",
+            "status:changed:resources",
+            "status:unmatched",
+            "status:unmatched:classes",
+            "status:unmatched:resources");
 
     public ProjectUiState {
         search = search == null ? "" : search;

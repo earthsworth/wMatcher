@@ -54,7 +54,9 @@ class JacksonProjectRepositoryTest {
         WMatcherProject restored = new JacksonProjectRepository().load(path);
 
         assertThat(restored.uiState().search()).isEqualTo("legacy");
-        assertThat(restored.uiState().expandedTreeKeys()).contains("root:classes", "root:resources");
+        assertThat(restored.uiState().expandedTreeKeys()).contains(
+                "status:changed", "status:changed:classes",
+                "status:unmatched", "status:unmatched:classes");
         assertThat(restored.uiState().navigationDividerLocation()).isEqualTo(340);
     }
 

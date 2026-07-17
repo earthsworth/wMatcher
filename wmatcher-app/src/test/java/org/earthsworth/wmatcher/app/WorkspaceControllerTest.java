@@ -15,9 +15,17 @@ import java.util.jar.JarOutputStream;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
+import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
 import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
+import org.earthsworth.wmatcher.engine.decompile.VineflowerDecompilerService;
+import org.earthsworth.wmatcher.engine.diff.DefaultDiffEngine;
+import org.earthsworth.wmatcher.engine.jar.JarArtifactLoader;
+import org.earthsworth.wmatcher.engine.jar.ZipArtifactInspector;
+import org.earthsworth.wmatcher.engine.mapping.MappingIoService;
+import org.earthsworth.wmatcher.engine.match.DefaultMatchingEngine;
+import org.earthsworth.wmatcher.engine.project.JacksonProjectRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.objectweb.asm.ClassWriter;
@@ -31,7 +39,7 @@ class WorkspaceControllerTest {
     void comparesTwoJarsThroughAsynchronousApplicationWorkflow() throws Exception {
         Path left = jar("old.jar", "example/Old", "read");
         Path right = jar("new.jar", "a/b", "x");
-        WorkspaceController controller = new WorkspaceController();
+        WorkspaceController controller = controllerWithLocalCache();
         CountDownLatch completed = new CountDownLatch(1);
         AtomicReference<WorkspaceController.Workspace> result = new AtomicReference<>();
         AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -51,6 +59,17 @@ class WorkspaceControllerTest {
         assertThat(result.get().matches().confirmed()).isNotEmpty();
         assertThat(result.get().differences().nodes()).isNotEmpty();
         controller.close();
+    }
+
+    private WorkspaceController controllerWithLocalCache() {
+        return new WorkspaceController(
+                new JarArtifactLoader(),
+                new DefaultMatchingEngine(),
+                new DefaultDiffEngine(),
+                new VineflowerDecompilerService(temporaryDirectory.resolve("source-cache")),
+                new ZipArtifactInspector(),
+                new JacksonProjectRepository(),
+                new MappingIoService());
     }
 
     @Test
@@ -129,6 +148,28 @@ class WorkspaceControllerTest {
         controller.close();
     }
 
+    @Test
+    void loadsOwningClassBytecodeAndSourceForAMethodNode() throws Exception {
+        Path left = jar("member-old.jar", "example/Owner", "read");
+        Path right = jar("member-new.jar", "a/b", "x");
+        WorkspaceController controller = controllerWithLocalCache();
+        WorkspaceController.Workspace workspace = compare(controller, left, right);
+        DiffNode method = workspace.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.METHOD)
+                .filter(node -> node.left() != null && node.left().name().equals("read"))
+                .findFirst()
+                .orElseThrow();
+
+        String bytecode = awaitText((success, failure) ->
+                controller.loadBytecode(method, true, true, success, failure));
+        String source = awaitText((success, failure) ->
+                controller.loadSource(method, true, true, success, failure));
+
+        assertThat(bytecode).contains("read()I");
+        assertThat(source).contains("read(");
+        controller.close();
+    }
+
     private WorkspaceController.Workspace compare(WorkspaceController controller, Path left, Path right)
             throws Exception {
         CountDownLatch completed = new CountDownLatch(1);
@@ -174,6 +215,22 @@ class WorkspaceControllerTest {
         return result.get();
     }
 
+    private static String awaitText(TextOperation operation) throws Exception {
+        CountDownLatch completed = new CountDownLatch(1);
+        AtomicReference<String> result = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        operation.start(value -> {
+            result.set(value);
+            completed.countDown();
+        }, throwable -> {
+            failure.set(throwable);
+            completed.countDown();
+        });
+        assertThat(completed.await(30, TimeUnit.SECONDS)).isTrue();
+        assertThat(failure.get()).isNull();
+        return result.get();
+    }
+
     private Path jar(String fileName, String className, String methodName) throws Exception {
         return jar(fileName, Map.of(className, methodName));
     }
@@ -195,6 +252,11 @@ class WorkspaceControllerTest {
         void start(
                 java.util.function.Consumer<WorkspaceController.Workspace> success,
                 java.util.function.Consumer<Throwable> failure);
+    }
+
+    @FunctionalInterface
+    private interface TextOperation {
+        void start(java.util.function.Consumer<String> success, java.util.function.Consumer<Throwable> failure);
     }
 
     private static byte[] classBytes(String className, String methodName) {

@@ -66,6 +66,62 @@ class SideBySideTextPanelThemeTest {
         SwingUtilities.invokeAndWait(() -> panel.setMinimapVisible(false));
         assertThat(panel.leftMinimapForTesting().isVisible()).isFalse();
         assertThat(panel.rightMinimapForTesting().isVisible()).isFalse();
+        assertThat(EditorMinimap.DIFF_RAIL_WIDTH).isEqualTo(8);
+        assertThat(EditorMinimap.DIFF_MARKER_HEIGHT).isGreaterThanOrEqualTo(4);
+        assertThat(EditorMinimap.DIFF_ANCHOR_HEIGHT).isGreaterThan(EditorMinimap.DIFF_MARKER_HEIGHT);
+    }
+
+    @Test
+    void searchesOnlyTheChosenSideAndSupportsFindOptions() throws Exception {
+        AtomicReference<SideBySideTextPanel> panelReference = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            SideBySideTextPanel panel = new SideBySideTextPanel();
+            panel.setTexts("Needle needle needles", "right needle");
+            panel.openFindForTesting(true);
+            panel.findFieldForTesting().setText("needle");
+            panel.setFindOptionsForTesting(true, true, false);
+            panel.findForTesting(true);
+            panelReference.set(panel);
+        });
+
+        SideBySideTextPanel panel = panelReference.get();
+        assertThat(panel.leftArea().getSelectedText()).isEqualTo("needle");
+        assertThat(panel.rightArea().getSelectionStart()).isEqualTo(panel.rightArea().getSelectionEnd());
+        assertThat(panel.findBarVisibleForTesting()).isTrue();
+
+        SwingUtilities.invokeAndWait(() -> {
+            panel.openFindForTesting(false);
+            panel.findFieldForTesting().setText("right\\s+needle");
+            panel.setFindOptionsForTesting(false, false, true);
+            panel.findForTesting(true);
+        });
+        assertThat(panel.rightArea().getSelectedText()).isEqualTo("right needle");
+
+        SwingUtilities.invokeAndWait(() -> {
+            panel.findFieldForTesting().setText("[");
+            panel.setFindOptionsForTesting(false, false, true);
+            panel.findForTesting(true);
+            panel.findFieldForTesting().getActionMap().get("close-find").actionPerformed(null);
+        });
+        assertThat(panel.findBarVisibleForTesting()).isFalse();
+    }
+
+    @Test
+    void revealsIndependentMemberRangesAfterLoadingText() throws Exception {
+        AtomicReference<SideBySideTextPanel> panelReference = new AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            SideBySideTextPanel panel = new SideBySideTextPanel();
+            panel.setTexts("header\n  oldMethod()V\nfooter", "header\n\n  newMethod()V\nfooter",
+                    MemberTextLocator.structure(org.earthsworth.wmatcher.core.model.EntityId.methodId(
+                            "old/Owner", "oldMethod", "()V")),
+                    MemberTextLocator.structure(org.earthsworth.wmatcher.core.model.EntityId.methodId(
+                            "new/Owner", "newMethod", "()V")));
+            panelReference.set(panel);
+        });
+        SwingUtilities.invokeAndWait(() -> { });
+
+        assertThat(panelReference.get().leftArea().getSelectedText()).contains("oldMethod()V");
+        assertThat(panelReference.get().rightArea().getSelectedText()).contains("newMethod()V");
     }
 
     private static int luminance(Color color) {

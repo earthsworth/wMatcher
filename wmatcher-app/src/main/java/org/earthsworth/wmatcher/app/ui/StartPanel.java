@@ -3,6 +3,7 @@ package org.earthsworth.wmatcher.app.ui;
 import static org.earthsworth.wmatcher.app.I18n.text;
 
 import java.awt.BorderLayout;
+import java.awt.CardLayout;
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
@@ -35,6 +36,9 @@ import org.earthsworth.wmatcher.app.AppPreferences;
 public final class StartPanel extends JPanel {
     private final DefaultListModel<AppPreferences.RecentProject> recentModel = new DefaultListModel<>();
     private final JList<AppPreferences.RecentProject> recentList = new JList<>(recentModel);
+    private final CardLayout recentCards = new CardLayout();
+    private final JPanel recentContent = new JPanel(recentCards);
+    private final JButton removeRecentButton = new JButton(text("start.removeRecent"));
     private final Consumer<Path> openRecent;
     private final Consumer<Path> removeRecent;
 
@@ -54,6 +58,10 @@ public final class StartPanel extends JPanel {
 
     JList<AppPreferences.RecentProject> recentListForTesting() {
         return recentList;
+    }
+
+    JButton removeRecentButtonForTesting() {
+        return removeRecentButton;
     }
 
     private JPanel actionRail(Runnable newProject, Runnable openProject) {
@@ -87,12 +95,6 @@ public final class StartPanel extends JPanel {
         heading.setFont(heading.getFont().deriveFont(Font.BOLD, 18f));
         panel.add(heading, BorderLayout.NORTH);
         projects.forEach(recentModel::addElement);
-        if (projects.isEmpty()) {
-            JLabel empty = new JLabel(text("start.noRecentProjects"), SwingConstants.CENTER);
-            empty.setForeground(UIManager.getColor("Label.disabledForeground"));
-            panel.add(empty, BorderLayout.CENTER);
-            return panel;
-        }
         recentList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         recentList.setCellRenderer(new RecentProjectRenderer());
         recentList.setFixedCellHeight(58);
@@ -113,8 +115,21 @@ public final class StartPanel extends JPanel {
         recentList.getActionMap().put("remove", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { removeSelected(); }
         });
-        recentList.setSelectedIndex(0);
-        panel.add(new JScrollPane(recentList), BorderLayout.CENTER);
+        recentList.addListSelectionListener(event -> updateRecentActions());
+        JLabel empty = new JLabel(text("start.noRecentProjects"), SwingConstants.CENTER);
+        empty.setForeground(UIManager.getColor("Label.disabledForeground"));
+        recentContent.add(empty, "empty");
+        recentContent.add(new JScrollPane(recentList), "list");
+        panel.add(recentContent, BorderLayout.CENTER);
+        JPanel actions = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 0, 0));
+        removeRecentButton.setToolTipText(text("start.removeRecentHint"));
+        removeRecentButton.addActionListener(event -> removeSelected());
+        actions.add(removeRecentButton);
+        panel.add(actions, BorderLayout.SOUTH);
+        if (!projects.isEmpty()) {
+            recentList.setSelectedIndex(0);
+        }
+        updateRecentActions();
         return panel;
     }
 
@@ -134,7 +149,14 @@ public final class StartPanel extends JPanel {
             if (!recentModel.isEmpty()) {
                 recentList.setSelectedIndex(Math.min(index, recentModel.size() - 1));
             }
+            updateRecentActions();
         }
+    }
+
+    private void updateRecentActions() {
+        boolean hasProjects = !recentModel.isEmpty();
+        recentCards.show(recentContent, hasProjects ? "list" : "empty");
+        removeRecentButton.setEnabled(hasProjects && recentList.getSelectedIndex() >= 0);
     }
 
     private static JButton actionButton(String label, Runnable action, boolean primary) {
