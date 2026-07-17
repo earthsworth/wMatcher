@@ -1089,5 +1089,10 @@ public final class WorkspaceController implements AutoCloseable {
             return new Workspace(left, right, matches, differences, overrides, leftLibraries, rightLibraries,
                     path, warning, uiState);
         }
+
+        Workspace withUiState(ProjectUiState state) {
+            return new Workspace(left, right, matches, differences, overrides, leftLibraries, rightLibraries,
+                    projectPath, warning, state);
+        }
     }
 }

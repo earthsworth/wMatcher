@@ -139,6 +139,10 @@ public final class MainFrame extends JFrame {
 
     private void showWelcome() {
         controller.cancel();
+        installWelcomePanel();
+    }
+
+    private void installWelcomePanel() {
         if (startPanel != null) {
             content.remove(startPanel);
         }
@@ -283,10 +287,29 @@ public final class MainFrame extends JFrame {
     }
 
     private void setLanguage(Locale locale) {
-        I18n.use(locale);
-        updateWindowTitle();
-        JOptionPane.showMessageDialog(this, text("dialog.languageRestart"), text("menu.language"),
-                JOptionPane.INFORMATION_MESSAGE);
+        try {
+            var uiState = workspacePanel == null ? null : workspacePanel.uiState();
+            I18n.use(locale);
+            setJMenuBar(menuBar());
+            cancel.setText(text("status.cancel"));
+            WorkspaceController.Workspace current = controller.workspace();
+            if (current == null) {
+                installWelcomePanel();
+            } else {
+                if (workspacePanel != null) content.remove(workspacePanel);
+                WorkspaceController.Workspace localized = uiState == null ? current : current.withUiState(uiState);
+                workspacePanel = new WorkspacePanel(controller, localized, this::showError);
+                workspacePanel.setMinimapsVisible(AppPreferences.minimapVisible());
+                content.add(workspacePanel, WORKSPACE);
+                cards.show(content, WORKSPACE);
+                status.setText(current.warning().isBlank() ? text("status.ready") : current.warning());
+            }
+            updateWindowTitle();
+            revalidate();
+            repaint();
+        } catch (RuntimeException exception) {
+            showError(exception);
+        }
     }
 
     private void showError(Throwable throwable) {

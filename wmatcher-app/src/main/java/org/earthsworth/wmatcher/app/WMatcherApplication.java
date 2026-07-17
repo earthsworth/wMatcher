@@ -15,6 +15,7 @@ public final class WMatcherApplication {
     public static void main(String[] arguments) {
         System.setProperty("wmatcher.log.dir", logDirectory().toString());
         System.setProperty("apple.laf.useScreenMenuBar", "true");
+        Locale.setDefault(AppPreferences.locale());
         installTheme(AppPreferences.theme());
         SwingUtilities.invokeLater(() -> new MainFrame(new WorkspaceController()).setVisible(true));
     }

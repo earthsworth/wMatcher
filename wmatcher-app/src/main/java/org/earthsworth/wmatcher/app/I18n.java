@@ -22,7 +22,10 @@ public final class I18n {
 
     public static void use(Locale locale) {
         AppPreferences.setLocale(locale);
-        bundle = load(locale);
+        Locale supported = AppPreferences.locale();
+        Locale.setDefault(supported);
+        ResourceBundle.clearCache();
+        bundle = load(supported);
     }
 
     private static ResourceBundle load(Locale locale) {

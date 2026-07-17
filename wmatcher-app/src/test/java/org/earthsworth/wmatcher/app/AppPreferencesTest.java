@@ -3,6 +3,7 @@ package org.earthsworth.wmatcher.app;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.prefs.Preferences;
 import org.junit.jupiter.api.AfterEach;
@@ -54,5 +55,20 @@ class AppPreferencesTest {
         AppPreferences.setMinimapVisible(preferences, false);
 
         assertThat(AppPreferences.minimapVisible(preferences)).isFalse();
+    }
+
+    @Test
+    void persistsAndNormalizesSupportedLanguages() {
+        AppPreferences.setLocale(preferences, Locale.SIMPLIFIED_CHINESE);
+        assertThat(AppPreferences.locale(preferences, Locale.ENGLISH))
+                .isEqualTo(Locale.SIMPLIFIED_CHINESE);
+
+        AppPreferences.setLocale(preferences, Locale.ENGLISH);
+        assertThat(AppPreferences.locale(preferences, Locale.SIMPLIFIED_CHINESE))
+                .isEqualTo(Locale.ENGLISH);
+
+        preferences.put("language", "fr-FR");
+        assertThat(AppPreferences.locale(preferences, Locale.SIMPLIFIED_CHINESE))
+                .isEqualTo(Locale.ENGLISH);
     }
 }

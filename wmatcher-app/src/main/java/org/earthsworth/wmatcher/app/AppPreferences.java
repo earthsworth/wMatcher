@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.prefs.Preferences;
+import java.util.prefs.BackingStoreException;
 
 public final class AppPreferences {
     private static final Preferences PREFERENCES = Preferences.userNodeForPackage(WMatcherApplication.class);
@@ -23,16 +24,33 @@ public final class AppPreferences {
     private AppPreferences() { }
 
     public static Locale locale() {
-        String stored = PREFERENCES.get(LANGUAGE, "");
+        return locale(PREFERENCES, Locale.getDefault());
+    }
+
+    static Locale locale(Preferences preferences, Locale systemLocale) {
+        String stored = preferences.get(LANGUAGE, "");
         if (stored.isBlank()) {
-            return Locale.getDefault().getLanguage().equals(Locale.CHINESE.getLanguage())
+            return systemLocale.getLanguage().equals(Locale.CHINESE.getLanguage())
                     ? Locale.SIMPLIFIED_CHINESE : Locale.ENGLISH;
         }
-        return Locale.forLanguageTag(stored);
+        Locale locale = Locale.forLanguageTag(stored);
+        return locale.getLanguage().equals(Locale.CHINESE.getLanguage())
+                ? Locale.SIMPLIFIED_CHINESE : Locale.ENGLISH;
     }
 
     public static void setLocale(Locale locale) {
-        PREFERENCES.put(LANGUAGE, locale.toLanguageTag());
+        setLocale(PREFERENCES, locale);
+    }
+
+    static void setLocale(Preferences preferences, Locale locale) {
+        Locale supported = locale.getLanguage().equals(Locale.CHINESE.getLanguage())
+                ? Locale.SIMPLIFIED_CHINESE : Locale.ENGLISH;
+        preferences.put(LANGUAGE, supported.toLanguageTag());
+        try {
+            preferences.flush();
+        } catch (BackingStoreException exception) {
+            throw new IllegalStateException("Unable to save language preference", exception);
+        }
     }
 
     public static String theme() {
