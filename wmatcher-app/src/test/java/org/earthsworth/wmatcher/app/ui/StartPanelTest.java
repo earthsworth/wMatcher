@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.awt.event.MouseEvent;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.SwingUtilities;
@@ -38,7 +39,7 @@ class StartPanelTest {
     }
 
     @Test
-    void visibleRemoveButtonOnlyRemovesTheRecentEntry() throws Exception {
+    void inlineRemoveHitTargetOnlyRemovesTheRecentEntry() throws Exception {
         Path project = Files.createFile(temporaryDirectory.resolve("kept.wmatch"));
         AtomicReference<Path> removed = new AtomicReference<>();
         AtomicReference<StartPanel> panelReference = new AtomicReference<>();
@@ -47,13 +48,14 @@ class StartPanelTest {
             StartPanel panel = new StartPanel(() -> { }, () -> { }, ignored -> { }, removed::set,
                     List.of(new AppPreferences.RecentProject(project, 1)));
             panelReference.set(panel);
-            assertThat(panel.removeRecentButtonForTesting().isEnabled()).isTrue();
-            panel.removeRecentButtonForTesting().doClick();
+            var list = panel.recentListForTesting();
+            list.setSize(500, 58);
+            list.dispatchEvent(new MouseEvent(list, MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(),
+                    0, 490, 20, 1, false, MouseEvent.BUTTON1));
         });
 
         assertThat(removed).hasValue(project.toAbsolutePath().normalize());
         assertThat(project).exists();
         assertThat(panelReference.get().recentListForTesting().getModel().getSize()).isZero();
-        assertThat(panelReference.get().removeRecentButtonForTesting().isEnabled()).isFalse();
     }
 }

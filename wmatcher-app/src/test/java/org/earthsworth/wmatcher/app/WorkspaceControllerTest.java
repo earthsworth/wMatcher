@@ -18,6 +18,7 @@ import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
+import org.earthsworth.wmatcher.core.model.ResolutionStatus;
 import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
 import org.earthsworth.wmatcher.engine.decompile.VineflowerDecompilerService;
 import org.earthsworth.wmatcher.engine.diff.DefaultDiffEngine;
@@ -146,6 +147,53 @@ class WorkspaceControllerTest {
         assertThat(undone.lockedMappings()).containsKey(method.left());
         assertThat(undone.lockedMappings()).doesNotContainKey(replacement.left());
         controller.close();
+    }
+
+    @Test
+    void confirmsPersistsAndRestoresASingleSidedAdditionAsAnUndoableEdit() throws Exception {
+        Path left = jar("resolution-old.jar", Map.of("same/Owner", "read"));
+        Path right = jar("resolution-new.jar", Map.of("same/Owner", "read", "new/Added", "value"));
+        Path project = temporaryDirectory.resolve("resolution.wmatch");
+        WorkspaceController controller = new WorkspaceController();
+        WorkspaceController.Workspace compared = compare(controller, left, right);
+        DiffNode addition = compared.differences().nodes().stream()
+                .filter(node -> node.kind() == EntityKind.CLASS && node.left() == null)
+                .filter(node -> node.right().name().equals("new/Added"))
+                .findFirst()
+                .orElseThrow();
+
+        WorkspaceController.Workspace confirmed = awaitMapping(
+                (success, failure) -> controller.confirmSingleSided(addition, success, failure));
+        assertThat(confirmed.confirmedAdded()).contains(addition.right());
+        assertThat(confirmed.differences().nodes().stream()
+                .filter(node -> addition.right().equals(node.right()))
+                .map(DiffNode::resolution))
+                .containsExactly(ResolutionStatus.CONFIRMED_ADDED);
+        assertThat(controller.hasUnsavedChanges()).isTrue();
+
+        WorkspaceController.Workspace undone = awaitMapping(controller::undoMappings);
+        assertThat(undone.confirmedAdded()).doesNotContain(addition.right());
+        WorkspaceController.Workspace redone = awaitMapping(controller::redoMappings);
+        assertThat(redone.confirmedAdded()).contains(addition.right());
+
+        awaitSave(controller, project);
+        controller.close();
+
+        WorkspaceController reopened = new WorkspaceController();
+        CountDownLatch opened = new CountDownLatch(1);
+        AtomicReference<WorkspaceController.Workspace> restored = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        reopened.openProject(project, ignored -> { }, workspace -> {
+            restored.set(workspace);
+            opened.countDown();
+        }, throwable -> {
+            failure.set(throwable);
+            opened.countDown();
+        });
+        assertThat(opened.await(15, TimeUnit.SECONDS)).isTrue();
+        assertThat(failure.get()).isNull();
+        assertThat(restored.get().confirmedAdded()).contains(addition.right());
+        reopened.close();
     }
 
     @Test

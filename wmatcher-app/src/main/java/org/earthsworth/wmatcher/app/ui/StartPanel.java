@@ -8,6 +8,8 @@ import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.Point;
+import java.awt.Rectangle;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -38,9 +40,9 @@ public final class StartPanel extends JPanel {
     private final JList<AppPreferences.RecentProject> recentList = new JList<>(recentModel);
     private final CardLayout recentCards = new CardLayout();
     private final JPanel recentContent = new JPanel(recentCards);
-    private final JButton removeRecentButton = new JButton(text("start.removeRecent"));
     private final Consumer<Path> openRecent;
     private final Consumer<Path> removeRecent;
+    private int hoveredRecentIndex = -1;
 
     public StartPanel(
             Runnable newProject,
@@ -58,10 +60,6 @@ public final class StartPanel extends JPanel {
 
     JList<AppPreferences.RecentProject> recentListForTesting() {
         return recentList;
-    }
-
-    JButton removeRecentButtonForTesting() {
-        return removeRecentButton;
     }
 
     private JPanel actionRail(Runnable newProject, Runnable openProject) {
@@ -99,14 +97,43 @@ public final class StartPanel extends JPanel {
         recentList.setCellRenderer(new RecentProjectRenderer());
         recentList.setFixedCellHeight(58);
         recentList.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
-        recentList.addMouseListener(new MouseAdapter() {
+        MouseAdapter recentMouseHandler = new MouseAdapter() {
             @Override
             public void mouseClicked(MouseEvent event) {
+                int index = recentIndexAt(event.getPoint());
+                if (index < 0) {
+                    return;
+                }
+                if (removeHit(index, event.getPoint())) {
+                    removeAt(index);
+                    return;
+                }
                 if (event.getClickCount() == 2) {
+                    recentList.setSelectedIndex(index);
                     openSelected();
                 }
             }
-        });
+
+            @Override
+            public void mouseMoved(MouseEvent event) {
+                int index = recentIndexAt(event.getPoint());
+                int nextHover = index >= 0 && removeHit(index, event.getPoint()) ? index : -1;
+                if (nextHover != hoveredRecentIndex) {
+                    hoveredRecentIndex = nextHover;
+                    recentList.repaint();
+                }
+                recentList.setToolTipText(nextHover >= 0 ? text("start.removeRecentHint") : null);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent event) {
+                hoveredRecentIndex = -1;
+                recentList.setToolTipText(null);
+                recentList.repaint();
+            }
+        };
+        recentList.addMouseListener(recentMouseHandler);
+        recentList.addMouseMotionListener(recentMouseHandler);
         recentList.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "open");
         recentList.getActionMap().put("open", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { openSelected(); }
@@ -115,17 +142,11 @@ public final class StartPanel extends JPanel {
         recentList.getActionMap().put("remove", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { removeSelected(); }
         });
-        recentList.addListSelectionListener(event -> updateRecentActions());
         JLabel empty = new JLabel(text("start.noRecentProjects"), SwingConstants.CENTER);
         empty.setForeground(UIManager.getColor("Label.disabledForeground"));
         recentContent.add(empty, "empty");
         recentContent.add(new JScrollPane(recentList), "list");
         panel.add(recentContent, BorderLayout.CENTER);
-        JPanel actions = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 0, 0));
-        removeRecentButton.setToolTipText(text("start.removeRecentHint"));
-        removeRecentButton.addActionListener(event -> removeSelected());
-        actions.add(removeRecentButton);
-        panel.add(actions, BorderLayout.SOUTH);
         if (!projects.isEmpty()) {
             recentList.setSelectedIndex(0);
         }
@@ -143,20 +164,38 @@ public final class StartPanel extends JPanel {
     private void removeSelected() {
         int index = recentList.getSelectedIndex();
         if (index >= 0) {
-            AppPreferences.RecentProject selected = recentModel.get(index);
-            recentModel.remove(index);
-            removeRecent.accept(selected.path());
-            if (!recentModel.isEmpty()) {
-                recentList.setSelectedIndex(Math.min(index, recentModel.size() - 1));
-            }
-            updateRecentActions();
+            removeAt(index);
         }
+    }
+
+    private void removeAt(int index) {
+        AppPreferences.RecentProject selected = recentModel.get(index);
+        recentModel.remove(index);
+        removeRecent.accept(selected.path());
+        hoveredRecentIndex = -1;
+        if (!recentModel.isEmpty()) {
+            recentList.setSelectedIndex(Math.min(index, recentModel.size() - 1));
+        }
+        updateRecentActions();
+    }
+
+    private int recentIndexAt(Point point) {
+        int index = recentList.locationToIndex(point);
+        if (index < 0) {
+            return -1;
+        }
+        Rectangle bounds = recentList.getCellBounds(index, index);
+        return bounds != null && bounds.contains(point) ? index : -1;
+    }
+
+    private boolean removeHit(int index, Point point) {
+        Rectangle bounds = recentList.getCellBounds(index, index);
+        return bounds != null && point.x >= bounds.x + bounds.width - 36;
     }
 
     private void updateRecentActions() {
         boolean hasProjects = !recentModel.isEmpty();
         recentCards.show(recentContent, hasProjects ? "list" : "empty");
-        removeRecentButton.setEnabled(hasProjects && recentList.getSelectedIndex() >= 0);
     }
 
     private static JButton actionButton(String label, Runnable action, boolean primary) {
@@ -170,7 +209,7 @@ public final class StartPanel extends JPanel {
         return button;
     }
 
-    private static final class RecentProjectRenderer extends DefaultListCellRenderer {
+    private final class RecentProjectRenderer extends DefaultListCellRenderer {
         @Override
         public Component getListCellRendererComponent(
                 JList<?> list, Object value, int index, boolean selected, boolean focused) {
@@ -189,11 +228,21 @@ public final class StartPanel extends JPanel {
             path.setForeground(foreground);
             cell.add(name, BorderLayout.NORTH);
             cell.add(path, BorderLayout.CENTER);
+            JPanel trailing = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 8, 0));
+            trailing.setOpaque(false);
             if (!exists) {
                 JLabel missing = new JLabel(text("start.missingProject"));
                 missing.setForeground(foreground);
-                cell.add(missing, BorderLayout.EAST);
+                trailing.add(missing);
             }
+            JLabel remove = new JLabel("×", SwingConstants.CENTER);
+            remove.setPreferredSize(new Dimension(24, 24));
+            remove.setFont(remove.getFont().deriveFont(Font.BOLD, 18f));
+            Color muted = UIManager.getColor("Label.disabledForeground");
+            Color accent = UIManager.getColor("Component.accentColor");
+            remove.setForeground(index == hoveredRecentIndex && accent != null ? accent : muted);
+            trailing.add(remove);
+            cell.add(trailing, BorderLayout.EAST);
             cell.setBackground(selected ? list.getSelectionBackground() : list.getBackground());
             return cell;
         }

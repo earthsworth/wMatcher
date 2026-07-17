@@ -13,9 +13,11 @@ public record ProjectUiState(
     private static final Set<String> DEFAULT_EXPANDED_TREE_KEYS = Set.of(
             "status:changed",
             "status:changed:classes",
+            "status:changed:members",
             "status:changed:resources",
             "status:unmatched",
             "status:unmatched:classes",
+            "status:unmatched:members",
             "status:unmatched:resources");
 
     public ProjectUiState {

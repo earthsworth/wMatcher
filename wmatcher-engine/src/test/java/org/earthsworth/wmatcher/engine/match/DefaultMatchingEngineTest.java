@@ -5,8 +5,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ClassModel;
+import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.FieldModel;
 import org.earthsworth.wmatcher.core.model.MappingOverrides;
@@ -119,6 +121,41 @@ class DefaultMatchingEngineTest {
         assertThat(result.candidates().keySet())
                 .contains(EntityId.fieldId(leftClass.internalName(), "collision", "La/A;"),
                         EntityId.fieldId(leftClass.internalName(), "collision", "Lb/B;"));
+    }
+
+    @Test
+    void retainsLowConfidenceAndNeighborBucketClassesForInspectionWithoutAutoConfirming() {
+        MethodModel leftMethod = method("left", "left-code", "left-structure");
+        MethodModel rightMethod = method("right", "right-code", "right-structure");
+        MethodModel extraMethod = method("extra", "extra-code", "extra-structure");
+        ClassModel leftClass = classModel("old/Source", List.of(), List.of(leftMethod), "left", "left");
+        ClassModel rightClass = classModel("new/Target", List.of(), List.of(rightMethod, extraMethod), "right", "right");
+        ArtifactSnapshot left = snapshot("low-left", Map.of(leftClass.internalName(), leftClass));
+        ArtifactSnapshot right = snapshot("low-right", Map.of(rightClass.internalName(), rightClass));
+
+        var result = new DefaultMatchingEngine().match(left, right, ComparisonOverrides.EMPTY,
+                MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(result.rankedCandidates().get(leftClass.id()))
+                .extracting(match -> match.right().name())
+                .containsExactly(rightClass.internalName());
+        assertThat(result.candidates()).doesNotContainKey(leftClass.id());
+        assertThat(result.confirmedMappings()).doesNotContainKey(leftClass.id());
+    }
+
+    @Test
+    void confirmedAdditionIsExcludedFromAutomaticAndRankedCandidates() {
+        ClassModel leftClass = classModel("old/Source", List.of(), List.of(), "same-structure", "same-code");
+        ClassModel rightClass = classModel("new/Target", List.of(), List.of(), "same-structure", "same-code");
+        ArtifactSnapshot left = snapshot("excluded-left", Map.of(leftClass.internalName(), leftClass));
+        ArtifactSnapshot right = snapshot("excluded-right", Map.of(rightClass.internalName(), rightClass));
+        ComparisonOverrides overrides = new ComparisonOverrides(Map.of(), Set.of(), Set.of(rightClass.id()));
+
+        var result = new DefaultMatchingEngine().match(left, right, overrides,
+                MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(result.confirmedMappings()).doesNotContainKey(leftClass.id());
+        assertThat(result.rankedCandidates().getOrDefault(leftClass.id(), List.of())).isEmpty();
     }
 
     private static ArtifactSnapshot snapshot(String name, Map<String, ClassModel> classes) {

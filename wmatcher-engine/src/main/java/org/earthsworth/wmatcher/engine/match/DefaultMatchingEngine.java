@@ -15,9 +15,9 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ClassModel;
+import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.FieldModel;
-import org.earthsworth.wmatcher.core.model.MappingOverrides;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchResult;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
@@ -38,7 +38,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
     public MatchResult match(
             ArtifactSnapshot left,
             ArtifactSnapshot right,
-            MappingOverrides overrides,
+            ComparisonOverrides overrides,
             MatchingPolicy policy,
             ProgressListener progress,
             CancellationToken cancellation) {
@@ -53,7 +53,9 @@ public final class DefaultMatchingEngine implements MatchingEngine {
         Map<EntityId, List<MatchDecision>> rankedCandidates = new LinkedHashMap<>();
         Set<EntityId> usedLeft = new HashSet<>();
         Set<EntityId> usedRight = new HashSet<>();
-        for (Map.Entry<EntityId, EntityId> locked : overrides.locked().entrySet()) {
+        usedLeft.addAll(overrides.confirmedRemoved());
+        usedRight.addAll(overrides.confirmedAdded());
+        for (Map.Entry<EntityId, EntityId> locked : overrides.lockedMappings().entrySet()) {
             MatchDecision decision = decision(locked.getKey(), locked.getValue(), MatchStatus.MANUAL_LOCKED, 1.0,
                     Map.of("manual", 1.0));
             confirmed.add(decision);
@@ -129,6 +131,10 @@ public final class DefaultMatchingEngine implements MatchingEngine {
         }
 
         Map<String, List<ClassModel>> rightByMethod = new HashMap<>();
+        Map<String, List<ClassModel>> rightByStructure = index(
+                right.classes().values(), ClassModel::structuralFingerprint);
+        Map<String, List<ClassModel>> rightByBytecode = index(
+                right.classes().values(), ClassModel::bytecodeFingerprint);
         Map<String, List<ClassModel>> rightByBucket = new HashMap<>();
         for (ClassModel model : right.classes().values()) {
             rightByBucket.computeIfAbsent(classBucket(model), ignored -> new ArrayList<>()).add(model);
@@ -149,40 +155,39 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             EntityId leftId = leftClass.id();
             if (!usedLeft.contains(leftId)) {
                 Set<ClassModel> pool = new LinkedHashSet<>();
+                ClassModel sameName = right.classes().get(leftClass.internalName());
+                if (sameName != null) {
+                    pool.add(sameName);
+                }
+                addOrdered(pool, rightExact.getOrDefault(exactClassKey(leftClass), List.of()), 500);
+                addOrdered(pool, rightByStructure.getOrDefault(leftClass.structuralFingerprint(), List.of()), 500);
+                addOrdered(pool, rightByBytecode.getOrDefault(leftClass.bytecodeFingerprint(), List.of()), 500);
                 for (MethodModel method : leftClass.methods()) {
                     if (method.instructionCount() > 0) {
                         List<ClassModel> sharedCode = rightByMethod.getOrDefault(
                                 method.instructionFingerprint(), List.of());
                         if (sharedCode.size() <= 500) {
-                            pool.addAll(sharedCode);
+                            addOrdered(pool, sharedCode, 500);
                         }
                     }
                 }
-                ClassModel sameName = right.classes().get(leftClass.internalName());
-                if (sameName != null) {
-                    pool.add(sameName);
+                int fieldTolerance = neighborTolerance(leftClass.fields().size());
+                int methodTolerance = neighborTolerance(leftClass.methods().size());
+                for (int fields = Math.max(0, leftClass.fields().size() - fieldTolerance);
+                        fields <= leftClass.fields().size() + fieldTolerance && pool.size() < 500; fields++) {
+                    for (int methods = Math.max(0, leftClass.methods().size() - methodTolerance);
+                            methods <= leftClass.methods().size() + methodTolerance && pool.size() < 500; methods++) {
+                        addOrdered(pool, rightByBucket.getOrDefault(
+                                classBucket(classKind(leftClass), fields, methods), List.of()), 500);
+                    }
                 }
-                List<ClassModel> shapeBucket = rightByBucket.getOrDefault(classBucket(leftClass), List.of());
-                if (shapeBucket.size() <= 200) {
-                    pool.addAll(shapeBucket);
-                } else if (pool.isEmpty()) {
-                    shapeBucket.stream().sorted(Comparator.comparing(ClassModel::internalName)).limit(200)
-                            .forEach(pool::add);
-                }
-                Set<ClassModel> candidatePool = pool;
-                if (pool.size() > 200) {
-                    candidatePool = pool.stream()
-                            .sorted(Comparator.comparing(ClassModel::internalName))
-                            .limit(200)
-                            .collect(Collectors.toCollection(LinkedHashSet::new));
-                }
-                List<CandidateScore> classScores = candidatePool.stream()
+                List<CandidateScore> classScores = pool.stream()
                         .filter(candidate -> !usedRight.contains(candidate.id()))
                         .filter(candidate -> classKind(candidate) == classKind(leftClass))
-                        .map(candidate -> classScore(leftClass, candidate))
-                        .filter(score -> score.breakdown().total() >= policy.candidateThreshold())
+                        .limit(500)
+                        .map(candidate -> classScore(leftClass, candidate,
+                                rightExact.getOrDefault(exactClassKey(leftClass), List.of()).size()))
                         .sorted(CandidateScore.ORDER)
-                        .limit(Math.max(20, policy.maxCandidates() * 4L))
                         .toList();
                 scored.put(leftId, classScores);
             }
@@ -212,8 +217,9 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                     .map(rightField -> new FieldPair(rightField,
                             EntityId.fieldId(right.internalName(), rightField.name(), rightField.descriptor())))
                     .filter(pair -> !usedRight.contains(pair.id()))
+                    .sorted(fieldPriority(leftField))
+                    .limit(500)
                     .map(pair -> fieldScore(leftField, pair.field(), pair.id()))
-                    .filter(score -> score.breakdown().total() >= policy.candidateThreshold())
                     .sorted(CandidateScore.ORDER)
                     .toList();
             scored.put(leftId, candidates);
@@ -243,8 +249,9 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                     .map(rightMethod -> new MethodPair(rightMethod,
                             EntityId.methodId(right.internalName(), rightMethod.name(), rightMethod.descriptor())))
                     .filter(pair -> !usedRight.contains(pair.id()))
+                    .sorted(methodPriority(leftMethod))
+                    .limit(500)
                     .map(pair -> methodScore(leftMethod, pair.method(), pair.id()))
-                    .filter(score -> score.breakdown().total() >= policy.candidateThreshold())
                     .sorted(CandidateScore.ORDER)
                     .toList();
             scored.put(leftId, candidates);
@@ -304,7 +311,12 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             if (usedLeft.contains(left) || entry.getValue().isEmpty()) {
                 continue;
             }
-            List<CandidateScore> candidates = entry.getValue();
+            List<CandidateScore> candidates = entry.getValue().stream()
+                    .filter(candidate -> candidate.breakdown().total() >= policy.candidateThreshold())
+                    .toList();
+            if (candidates.isEmpty()) {
+                continue;
+            }
             CandidateScore best = candidates.getFirst();
             double runnerUp = candidates.size() > 1 ? candidates.get(1).breakdown().total() : 0.0;
             long leftPerfectCount = candidates.stream().filter(DefaultMatchingEngine::isPerfect).count();
@@ -344,7 +356,7 @@ public final class DefaultMatchingEngine implements MatchingEngine {
         return candidate.breakdown().total() >= 1.0 - 1.0e-12;
     }
 
-    private static CandidateScore classScore(ClassModel left, ClassModel right) {
+    private static CandidateScore classScore(ClassModel left, ClassModel right, int equivalentTargets) {
         double fields = jaccard(left.fields().stream().map(FieldModel::fingerprint).toList(),
                 right.fields().stream().map(FieldModel::fingerprint).toList());
         double methods = jaccard(left.methods().stream().map(MethodModel::structuralFingerprint).toList(),
@@ -358,12 +370,16 @@ public final class DefaultMatchingEngine implements MatchingEngine {
                 + closeness(left.methods().size(), right.methods().size())) / 2.0;
         double hierarchy = closeness(left.interfaces().size(), right.interfaces().size());
         double name = left.internalName().equals(right.internalName()) ? 1.0 : 0.0;
-        Map<String, Double> components = Map.of(
-                "structure", structure,
-                "code", code,
-                "shape", shape,
-                "hierarchy", hierarchy,
-                "stableName", name);
+        Map<String, Double> components = new LinkedHashMap<>();
+        components.put("structure", structure);
+        components.put("code", code);
+        components.put("shape", shape);
+        components.put("hierarchy", hierarchy);
+        components.put("stableName", name);
+        if (exactClassKey(left).equals(exactClassKey(right))) {
+            components.put("exactFingerprint", 1.0);
+            components.put("equivalentTargets", (double) equivalentTargets);
+        }
         double fingerprintScore = structure * 0.35 + code * 0.40 + shape * 0.15 + hierarchy * 0.05 + name * 0.05;
         double stableIdentityScore = name == 0.0 ? 0.0
                 : 0.78 + structure * 0.10 + code * 0.05 + shape * 0.04 + hierarchy * 0.03;
@@ -408,15 +424,22 @@ public final class DefaultMatchingEngine implements MatchingEngine {
             model.methods().forEach(method -> result.add(EntityId.methodId(
                     model.internalName(), method.name(), method.descriptor())));
         });
+        artifact.resources().values().forEach(resource -> result.add(resource.id()));
         return result;
     }
 
-    private static void validateOverrides(MappingOverrides overrides, Set<EntityId> left, Set<EntityId> right) {
-        overrides.locked().forEach((leftId, rightId) -> {
+    private static void validateOverrides(ComparisonOverrides overrides, Set<EntityId> left, Set<EntityId> right) {
+        overrides.lockedMappings().forEach((leftId, rightId) -> {
             if (!left.contains(leftId) || !right.contains(rightId)) {
                 throw new IllegalArgumentException("Locked mapping references an entity that is not present: " + leftId);
             }
         });
+        if (!left.containsAll(overrides.confirmedRemoved())) {
+            throw new IllegalArgumentException("Confirmed removals contain entities not present on the old side");
+        }
+        if (!right.containsAll(overrides.confirmedAdded())) {
+            throw new IllegalArgumentException("Confirmed additions contain entities not present on the new side");
+        }
     }
 
     private static <T> Map<String, List<T>> index(Collection<T> values, Function<T, String> keyFunction) {
@@ -428,7 +451,48 @@ public final class DefaultMatchingEngine implements MatchingEngine {
     }
 
     private static String classBucket(ClassModel model) {
-        return classKind(model) + ":" + model.fields().size() + ':' + model.methods().size();
+        return classBucket(classKind(model), model.fields().size(), model.methods().size());
+    }
+
+    private static String classBucket(int kind, int fields, int methods) {
+        return kind + ":" + fields + ':' + methods;
+    }
+
+    private static int neighborTolerance(int count) {
+        return Math.max(1, Math.min(4, (int) Math.ceil(count * 0.10)));
+    }
+
+    private static void addOrdered(Set<ClassModel> target, Collection<ClassModel> candidates, int maximum) {
+        for (ClassModel candidate : candidates.stream()
+                .sorted(Comparator.comparing(ClassModel::internalName)).toList()) {
+            if (target.size() >= maximum) {
+                return;
+            }
+            target.add(candidate);
+        }
+    }
+
+    private static Comparator<FieldPair> fieldPriority(FieldModel left) {
+        return Comparator
+                .comparingInt((FieldPair pair) -> left.name().equals(pair.field().name())
+                        && left.descriptor().equals(pair.field().descriptor()) ? 0 : 1)
+                .thenComparingInt(pair -> left.fingerprint().equals(pair.field().fingerprint()) ? 0 : 1)
+                .thenComparingInt(pair -> descriptorShape(left.descriptor())
+                        .equals(descriptorShape(pair.field().descriptor())) ? 0 : 1)
+                .thenComparing(pair -> pair.id().externalName());
+    }
+
+    private static Comparator<MethodPair> methodPriority(MethodModel left) {
+        return Comparator
+                .comparingInt((MethodPair pair) -> left.name().equals(pair.method().name())
+                        && left.descriptor().equals(pair.method().descriptor()) ? 0 : 1)
+                .thenComparingInt(pair -> left.instructionFingerprint()
+                        .equals(pair.method().instructionFingerprint()) ? 0 : 1)
+                .thenComparingInt(pair -> left.structuralFingerprint()
+                        .equals(pair.method().structuralFingerprint()) ? 0 : 1)
+                .thenComparingInt(pair -> descriptorShape(left.descriptor())
+                        .equals(descriptorShape(pair.method().descriptor())) ? 0 : 1)
+                .thenComparing(pair -> pair.id().externalName());
     }
 
     private static int classKind(ClassModel model) {

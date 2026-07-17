@@ -22,12 +22,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import javax.swing.SwingUtilities;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
+import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.DecompileRequest;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.DiffResult;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
-import org.earthsworth.wmatcher.core.model.MappingOverrides;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchResult;
 import org.earthsworth.wmatcher.core.model.MatchingPolicy;
@@ -61,8 +61,8 @@ public final class WorkspaceController implements AutoCloseable {
     private final ProjectRepository projects;
     private final MappingService mappings;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    private final Deque<Map<EntityId, EntityId>> undo = new ArrayDeque<>();
-    private final Deque<Map<EntityId, EntityId>> redo = new ArrayDeque<>();
+    private final Deque<ComparisonOverrides> undo = new ArrayDeque<>();
+    private final Deque<ComparisonOverrides> redo = new ArrayDeque<>();
     private final List<Consumer<Boolean>> documentStateListeners = new CopyOnWriteArrayList<>();
     private final AtomicLong documentRevision = new AtomicLong();
     private volatile AtomicBoolean cancellation = new AtomicBoolean();
@@ -126,15 +126,15 @@ public final class WorkspaceController implements AutoCloseable {
                 ArtifactSnapshot left = leftFuture.join();
                 ArtifactSnapshot right = rightFuture.join();
                 token.throwIfCancelled();
-                FilteredMappings filtered = validMappings(request.initialMappings(), left, right);
+                FilteredOverrides filtered = validOverrides(request.initialOverrides(), left, right);
                 progress(progress, new ProgressUpdate("Matching entities", 0, 1));
-                MatchResult matchResult = matcher.match(left, right, new MappingOverrides(filtered.mappings()),
+                MatchResult matchResult = matcher.match(left, right, filtered.overrides(),
                         MatchingPolicy.conservativeV1(),
                         (stage, completed, total) -> progress(progress, new ProgressUpdate(stage, completed, total)), token);
-                DiffResult diffResult = differ.diff(left, right, matchResult,
+                DiffResult diffResult = differ.diff(left, right, matchResult, filtered.overrides(),
                         (stage, completed, total) -> progress(progress, new ProgressUpdate(stage, completed, total)), token);
                 String warning = warning(request, left, right, filtered.dropped());
-                Workspace result = new Workspace(left, right, matchResult, diffResult, filtered.mappings(),
+                Workspace result = new Workspace(left, right, matchResult, diffResult, filtered.overrides(),
                         request.leftLibraries(), request.rightLibraries(), request.projectPath(), warning,
                         request.uiState());
                 workspace = result;
@@ -168,7 +168,8 @@ public final class WorkspaceController implements AutoCloseable {
                         project.targetRelease(),
                         List.of(),
                         List.of(),
-                        project.lockedMappings(),
+                        new ComparisonOverrides(project.lockedMappings(), project.confirmedRemoved(),
+                                project.confirmedAdded()),
                         projectPath,
                         project.left().sha256(),
                         project.right().sha256(),
@@ -192,6 +193,8 @@ public final class WorkspaceController implements AutoCloseable {
                         current.left().targetRelease(),
                         MatchingPolicy.conservativeV1().version(),
                         current.lockedMappings(),
+                        current.confirmedRemoved(),
+                        current.confirmedAdded(),
                         uiState);
                 projects.save(path, project);
                 Workspace latest = workspace;
@@ -210,8 +213,12 @@ public final class WorkspaceController implements AutoCloseable {
     public void lockMapping(MatchDecision decision, Consumer<Workspace> success, Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
         Map<EntityId, EntityId> updated = new LinkedHashMap<>(current.lockedMappings());
+        Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
+        Set<EntityId> added = new HashSet<>(current.confirmedAdded());
         updated.entrySet().removeIf(entry -> entry.getKey().equals(decision.left())
                 || entry.getValue().equals(decision.right()));
+        removed.remove(decision.left());
+        added.remove(decision.right());
         updated.put(decision.left(), decision.right());
         if (decision.left().kind() == EntityKind.CLASS) {
             Map<EntityId, EntityId> projectedClasses = new LinkedHashMap<>();
@@ -224,7 +231,7 @@ public final class WorkspaceController implements AutoCloseable {
             updated.entrySet().removeIf(entry -> isMember(entry.getKey())
                     && !ownersMatch(entry.getKey(), entry.getValue(), projectedClasses));
         }
-        pushAndRecompute(current.lockedMappings(), updated, success, failure);
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(updated, removed, added), success, failure);
     }
 
     public void unlockMapping(EntityId left, Consumer<Workspace> success, Consumer<Throwable> failure) {
@@ -239,7 +246,39 @@ public final class WorkspaceController implements AutoCloseable {
                     && (entry.getKey().owner().equals(left.name())
                     || entry.getValue().owner().equals(previousRight.name())));
         }
-        pushAndRecompute(current.lockedMappings(), updated, success, failure);
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                updated, current.confirmedRemoved(), current.confirmedAdded()), success, failure);
+    }
+
+    public void confirmSingleSided(
+            DiffNode node, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        if ((node.left() == null) == (node.right() == null)) {
+            return;
+        }
+        Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
+        Set<EntityId> added = new HashSet<>(current.confirmedAdded());
+        if (node.left() != null) {
+            removed.add(node.left());
+        } else {
+            added.add(node.right());
+        }
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                current.lockedMappings(), removed, added), success, failure);
+    }
+
+    public void clearSingleSidedResolution(
+            DiffNode node, Consumer<Workspace> success, Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        Set<EntityId> removed = new HashSet<>(current.confirmedRemoved());
+        Set<EntityId> added = new HashSet<>(current.confirmedAdded());
+        boolean changed = node.left() != null ? removed.remove(node.left())
+                : node.right() != null && added.remove(node.right());
+        if (!changed) {
+            return;
+        }
+        pushAndRecompute(current.overrides(), new ComparisonOverrides(
+                current.lockedMappings(), removed, added), success, failure);
     }
 
     public void undoMappings(Consumer<Workspace> success, Consumer<Throwable> failure) {
@@ -247,8 +286,8 @@ public final class WorkspaceController implements AutoCloseable {
             return;
         }
         Workspace current = requireWorkspace();
-        Map<EntityId, EntityId> target = undo.pop();
-        redo.push(current.lockedMappings());
+        ComparisonOverrides target = undo.pop();
+        redo.push(current.overrides());
         recompute(target, success, failure);
     }
 
@@ -257,8 +296,8 @@ public final class WorkspaceController implements AutoCloseable {
             return;
         }
         Workspace current = requireWorkspace();
-        Map<EntityId, EntityId> target = redo.pop();
-        undo.push(current.lockedMappings());
+        ComparisonOverrides target = redo.pop();
+        undo.push(current.overrides());
         recompute(target, success, failure);
     }
 
@@ -358,31 +397,31 @@ public final class WorkspaceController implements AutoCloseable {
     }
 
     private void pushAndRecompute(
-            Map<EntityId, EntityId> previous,
-            Map<EntityId, EntityId> updated,
+            ComparisonOverrides previous,
+            ComparisonOverrides updated,
             Consumer<Workspace> success,
             Consumer<Throwable> failure) {
         if (previous.equals(updated)) {
             onEdt(() -> success.accept(requireWorkspace()));
             return;
         }
-        undo.push(Map.copyOf(previous));
+        undo.push(previous);
         redo.clear();
         recompute(updated, success, failure);
     }
 
     private void recompute(
-            Map<EntityId, EntityId> locked,
+            ComparisonOverrides overrides,
             Consumer<Workspace> success,
             Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
         executor.submit(() -> {
             try {
-                MatchResult matchResult = matcher.match(current.left(), current.right(), new MappingOverrides(locked),
+                MatchResult matchResult = matcher.match(current.left(), current.right(), overrides,
                         MatchingPolicy.conservativeV1(), (stage, completed, total) -> { }, CancellationToken.NONE);
-                DiffResult diffResult = differ.diff(current.left(), current.right(), matchResult,
+                DiffResult diffResult = differ.diff(current.left(), current.right(), matchResult, overrides,
                         (stage, completed, total) -> { }, CancellationToken.NONE);
-                Workspace updated = current.withAnalysis(matchResult, diffResult, locked);
+                Workspace updated = current.withAnalysis(matchResult, diffResult, overrides);
                 workspace = updated;
                 documentRevision.incrementAndGet();
                 onEdt(() -> {
@@ -403,8 +442,10 @@ public final class WorkspaceController implements AutoCloseable {
         executor.submit(() -> {
             try {
                 Map<EntityId, EntityId> imported = importer.get();
-                Map<EntityId, EntityId> merged = mergeWithoutOverwriting(current.lockedMappings(), imported);
-                onEdt(() -> pushAndRecompute(current.lockedMappings(), merged, success, failure));
+                Map<EntityId, EntityId> merged = mergeWithoutOverwriting(current.overrides(), imported);
+                ComparisonOverrides updated = new ComparisonOverrides(
+                        merged, current.confirmedRemoved(), current.confirmedAdded());
+                onEdt(() -> pushAndRecompute(current.overrides(), updated, success, failure));
             } catch (Throwable throwable) {
                 onEdt(() -> failure.accept(unwrap(throwable)));
             }
@@ -412,11 +453,13 @@ public final class WorkspaceController implements AutoCloseable {
     }
 
     private static Map<EntityId, EntityId> mergeWithoutOverwriting(
-            Map<EntityId, EntityId> existing, Map<EntityId, EntityId> imported) {
-        Map<EntityId, EntityId> merged = new LinkedHashMap<>(existing);
-        Set<EntityId> usedRight = new HashSet<>(existing.values());
+            ComparisonOverrides existing, Map<EntityId, EntityId> imported) {
+        Map<EntityId, EntityId> merged = new LinkedHashMap<>(existing.lockedMappings());
+        Set<EntityId> usedRight = new HashSet<>(existing.lockedMappings().values());
         imported.forEach((left, right) -> {
-            if (!merged.containsKey(left) && usedRight.add(right)) {
+            if (!existing.confirmedRemoved().contains(left)
+                    && !existing.confirmedAdded().contains(right)
+                    && !merged.containsKey(left) && usedRight.add(right)) {
                 merged.put(left, right);
             }
         });
@@ -460,23 +503,34 @@ public final class WorkspaceController implements AutoCloseable {
         }
     }
 
-    private static FilteredMappings validMappings(
-            Map<EntityId, EntityId> requested, ArtifactSnapshot left, ArtifactSnapshot right) {
+    private static FilteredOverrides validOverrides(
+            ComparisonOverrides requested, ArtifactSnapshot left, ArtifactSnapshot right) {
+        Set<EntityId> removed = requested.confirmedRemoved().stream()
+                .filter(id -> entityExists(left, id))
+                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
+        Set<EntityId> added = requested.confirmedAdded().stream()
+                .filter(id -> entityExists(right, id))
+                .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new));
         Map<EntityId, EntityId> result = new LinkedHashMap<>();
         Set<EntityId> rightUsed = new HashSet<>();
-        int dropped = 0;
-        for (Map.Entry<EntityId, EntityId> entry : requested.entrySet()) {
+        int dropped = requested.confirmedRemoved().size() - removed.size()
+                + requested.confirmedAdded().size() - added.size();
+        for (Map.Entry<EntityId, EntityId> entry : requested.lockedMappings().entrySet()) {
             if (entityExists(left, entry.getKey()) && entityExists(right, entry.getValue())
+                    && !removed.contains(entry.getKey()) && !added.contains(entry.getValue())
                     && rightUsed.add(entry.getValue())) {
                 result.put(entry.getKey(), entry.getValue());
             } else {
                 dropped++;
             }
         }
-        return new FilteredMappings(Map.copyOf(result), dropped);
+        return new FilteredOverrides(new ComparisonOverrides(result, removed, added), dropped);
     }
 
     private static boolean entityExists(ArtifactSnapshot artifact, EntityId id) {
+        if (id.kind() == EntityKind.RESOURCE) {
+            return artifact.resources().containsKey(id.name());
+        }
         var owner = artifact.classes().get(id.kind() == EntityKind.CLASS ? id.name() : id.owner());
         if (owner == null) {
             return false;
@@ -487,7 +541,7 @@ public final class WorkspaceController implements AutoCloseable {
                     && field.descriptor().equals(id.descriptor()));
             case METHOD -> owner.methods().stream().anyMatch(method -> method.name().equals(id.name())
                     && method.descriptor().equals(id.descriptor()));
-            case RESOURCE -> artifact.resources().containsKey(id.name());
+            case RESOURCE -> false;
         };
     }
 
@@ -500,7 +554,7 @@ public final class WorkspaceController implements AutoCloseable {
             warnings.add("New Jar hash changed");
         }
         if (dropped > 0) {
-            warnings.add(dropped + " saved mappings could not be validated");
+            warnings.add(dropped + " saved mappings or resolutions could not be validated");
         }
         return String.join("; ", warnings);
     }
@@ -582,7 +636,7 @@ public final class WorkspaceController implements AutoCloseable {
         T get() throws Exception;
     }
 
-    private record FilteredMappings(Map<EntityId, EntityId> mappings, int dropped) { }
+    private record FilteredOverrides(ComparisonOverrides overrides, int dropped) { }
 
     public record CompareRequest(
             Path leftJar,
@@ -590,7 +644,7 @@ public final class WorkspaceController implements AutoCloseable {
             int targetRelease,
             List<Path> leftLibraries,
             List<Path> rightLibraries,
-            Map<EntityId, EntityId> initialMappings,
+            ComparisonOverrides initialOverrides,
             Path projectPath,
             String expectedLeftHash,
             String expectedRightHash,
@@ -598,7 +652,7 @@ public final class WorkspaceController implements AutoCloseable {
         public CompareRequest {
             leftLibraries = List.copyOf(leftLibraries);
             rightLibraries = List.copyOf(rightLibraries);
-            initialMappings = Map.copyOf(initialMappings);
+            initialOverrides = initialOverrides == null ? ComparisonOverrides.EMPTY : initialOverrides;
             expectedLeftHash = expectedLeftHash == null ? "" : expectedLeftHash;
             expectedRightHash = expectedRightHash == null ? "" : expectedRightHash;
             uiState = uiState == null ? ProjectUiState.empty() : uiState;
@@ -606,7 +660,8 @@ public final class WorkspaceController implements AutoCloseable {
 
         public static CompareRequest fresh(
                 Path left, Path right, int release, List<Path> leftLibraries, List<Path> rightLibraries) {
-            return new CompareRequest(left, right, release, leftLibraries, rightLibraries, Map.of(), null, "", "",
+            return new CompareRequest(left, right, release, leftLibraries, rightLibraries,
+                    ComparisonOverrides.EMPTY, null, "", "",
                     ProjectUiState.empty());
         }
     }
@@ -618,27 +673,55 @@ public final class WorkspaceController implements AutoCloseable {
             ArtifactSnapshot right,
             MatchResult matches,
             DiffResult differences,
-            Map<EntityId, EntityId> lockedMappings,
+            ComparisonOverrides overrides,
             List<Path> leftLibraries,
             List<Path> rightLibraries,
             Path projectPath,
             String warning,
             ProjectUiState uiState) {
         public Workspace {
-            lockedMappings = Map.copyOf(lockedMappings);
+            overrides = overrides == null ? ComparisonOverrides.EMPTY : overrides;
             leftLibraries = List.copyOf(leftLibraries);
             rightLibraries = List.copyOf(rightLibraries);
             warning = warning == null ? "" : warning;
             uiState = uiState == null ? ProjectUiState.empty() : uiState;
         }
 
-        Workspace withAnalysis(MatchResult newMatches, DiffResult newDifferences, Map<EntityId, EntityId> locked) {
-            return new Workspace(left, right, newMatches, newDifferences, locked, leftLibraries, rightLibraries,
+        public Workspace(
+                ArtifactSnapshot left,
+                ArtifactSnapshot right,
+                MatchResult matches,
+                DiffResult differences,
+                Map<EntityId, EntityId> lockedMappings,
+                List<Path> leftLibraries,
+                List<Path> rightLibraries,
+                Path projectPath,
+                String warning,
+                ProjectUiState uiState) {
+            this(left, right, matches, differences, new ComparisonOverrides(lockedMappings), leftLibraries,
+                    rightLibraries, projectPath, warning, uiState);
+        }
+
+        public Map<EntityId, EntityId> lockedMappings() {
+            return overrides.lockedMappings();
+        }
+
+        public Set<EntityId> confirmedRemoved() {
+            return overrides.confirmedRemoved();
+        }
+
+        public Set<EntityId> confirmedAdded() {
+            return overrides.confirmedAdded();
+        }
+
+        Workspace withAnalysis(
+                MatchResult newMatches, DiffResult newDifferences, ComparisonOverrides newOverrides) {
+            return new Workspace(left, right, newMatches, newDifferences, newOverrides, leftLibraries, rightLibraries,
                     projectPath, warning, uiState);
         }
 
         Workspace withProjectPath(Path path) {
-            return new Workspace(left, right, matches, differences, lockedMappings, leftLibraries, rightLibraries,
+            return new Workspace(left, right, matches, differences, overrides, leftLibraries, rightLibraries,
                     path, warning, uiState);
         }
     }

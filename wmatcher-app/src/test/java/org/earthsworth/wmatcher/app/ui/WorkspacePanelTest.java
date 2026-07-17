@@ -17,6 +17,7 @@ import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.MatchResult;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchStatus;
+import org.earthsworth.wmatcher.core.model.ResolutionStatus;
 import org.earthsworth.wmatcher.core.model.ScoreBreakdown;
 import org.earthsworth.wmatcher.core.project.ProjectUiState;
 import org.junit.jupiter.api.Test;
@@ -37,6 +38,7 @@ class WorkspacePanelTest {
 
         assertThat(result.panel).isNotNull();
         assertThat(result.panel.getComponentCount()).isGreaterThan(0);
+        assertThat(result.panel.summaryCardCountForTesting()).isEqualTo(5);
         controller.close();
     }
 
@@ -146,8 +148,30 @@ class WorkspacePanelTest {
         assertThat(result.panel.rootKeysForTesting()).containsExactly(
                 "status:changed", "status:unmatched", "status:unchanged");
         assertThat(result.panel.stableTreeKeysForTesting())
-                .contains("status:changed:classes", "status:unmatched:classes", "status:unchanged:resources")
-                .anyMatch(key -> key.startsWith("owner:unmatched:L:old/Changed"));
+                .contains("status:changed:classes", "status:unmatched:members", "status:unchanged:resources")
+                .anyMatch(key -> key.startsWith("member-owner:unmatched:L:old/Changed"));
+        assertThat(result.panel.stableTreeKeysForTesting().stream()
+                .filter(key -> key.equals("entity:L:CLASS:old/Changed")))
+                .hasSize(1);
+        controller.close();
+    }
+
+    @Test
+    void placesConfirmedSingleSidedEntitiesInChangedInsteadOfUnmatched() throws Exception {
+        EntityId addedId = EntityId.resourceId("added.txt");
+        DiffNode added = new DiffNode("resource:R:added.txt", "added.txt", EntityKind.RESOURCE,
+                null, addedId, java.util.Set.of(ChangeKind.ADDED), ResolutionStatus.CONFIRMED_ADDED);
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(), java.util.Set.of(addedId)),
+                new DiffResult(List.of(added), Map.of()), Map.of(), List.of(), List.of(), null, "",
+                ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> result.panel = new WorkspacePanel(controller, workspace, ignored -> { }));
+
+        assertThat(result.panel.rootKeysForTesting()).containsExactly("status:changed");
         controller.close();
     }
 

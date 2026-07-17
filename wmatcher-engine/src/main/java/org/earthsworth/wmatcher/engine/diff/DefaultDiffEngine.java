@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ChangeKind;
 import org.earthsworth.wmatcher.core.model.ClassModel;
+import org.earthsworth.wmatcher.core.model.ComparisonOverrides;
 import org.earthsworth.wmatcher.core.model.DiffNode;
 import org.earthsworth.wmatcher.core.model.DiffResult;
 import org.earthsworth.wmatcher.core.model.EntityId;
@@ -23,6 +24,7 @@ import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchResult;
 import org.earthsworth.wmatcher.core.model.MethodModel;
 import org.earthsworth.wmatcher.core.model.ResourceModel;
+import org.earthsworth.wmatcher.core.model.ResolutionStatus;
 import org.earthsworth.wmatcher.core.service.DiffEngine;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
 import org.earthsworth.wmatcher.core.task.ProgressListener;
@@ -33,6 +35,7 @@ public final class DefaultDiffEngine implements DiffEngine {
             ArtifactSnapshot left,
             ArtifactSnapshot right,
             MatchResult matches,
+            ComparisonOverrides overrides,
             ProgressListener progress,
             CancellationToken cancellation) {
         List<DiffNode> nodes = new ArrayList<>();
@@ -66,7 +69,7 @@ public final class DefaultDiffEngine implements DiffEngine {
             if (!matchedLeft.contains(model.id())) {
                 nodes.add(new DiffNode("class:L:" + model.internalName(), model.internalName(), EntityKind.CLASS,
                         model.id(), null, Set.of(candidateLeft.contains(model.id())
-                                ? ChangeKind.UNRESOLVED : ChangeKind.REMOVED)));
+                                ? ChangeKind.UNRESOLVED : ChangeKind.REMOVED), resolution(model.id(), true, overrides)));
             }
         }
         for (ClassModel model : right.classes().values()) {
@@ -74,14 +77,14 @@ public final class DefaultDiffEngine implements DiffEngine {
             if (!matchedRight.contains(model.id())) {
                 nodes.add(new DiffNode("class:R:" + model.internalName(), model.internalName(), EntityKind.CLASS,
                         null, model.id(), Set.of(candidateRight.contains(model.id())
-                                ? ChangeKind.UNRESOLVED : ChangeKind.ADDED)));
+                                ? ChangeKind.UNRESOLVED : ChangeKind.ADDED), resolution(model.id(), false, overrides)));
             }
         }
 
-        addUnmatchedMembers(left, matches.unmatchedLeft(), matchedClasses.keySet(), candidateLeft, true, nodes);
+        addUnmatchedMembers(left, matches.unmatchedLeft(), matchedClasses.keySet(), candidateLeft, true, overrides, nodes);
         addUnmatchedMembers(right, matches.unmatchedRight(), new HashSet<>(matchedClasses.values()), candidateRight,
-                false, nodes);
-        addResourceNodes(left.resources(), right.resources(), nodes, cancellation);
+                false, overrides, nodes);
+        addResourceNodes(left.resources(), right.resources(), overrides, nodes, cancellation);
 
         nodes.sort(Comparator.comparing(DiffNode::kind).thenComparing(DiffNode::displayName));
         Map<ChangeKind, Long> counts = new EnumMap<>(ChangeKind.class);
@@ -150,6 +153,7 @@ public final class DefaultDiffEngine implements DiffEngine {
             Set<String> matchedOwners,
             Set<EntityId> candidates,
             boolean left,
+            ComparisonOverrides overrides,
             List<DiffNode> nodes) {
         for (EntityId id : unmatched) {
             if ((id.kind() == EntityKind.FIELD || id.kind() == EntityKind.METHOD) && matchedOwners.contains(id.owner())) {
@@ -161,7 +165,8 @@ public final class DefaultDiffEngine implements DiffEngine {
                         id.kind(),
                         left ? id : null,
                         left ? null : id,
-                        Set.of(change)));
+                        Set.of(change),
+                        resolution(id, left, overrides)));
             }
         }
     }
@@ -169,6 +174,7 @@ public final class DefaultDiffEngine implements DiffEngine {
     private static void addResourceNodes(
             Map<String, ResourceModel> left,
             Map<String, ResourceModel> right,
+            ComparisonOverrides overrides,
             List<DiffNode> nodes,
             CancellationToken cancellation) {
         Set<String> common = new HashSet<>(left.keySet());
@@ -204,11 +210,23 @@ public final class DefaultDiffEngine implements DiffEngine {
         left.values().stream()
                 .filter(resource -> !common.contains(resource.path()) && !movedLeft.contains(resource.path()))
                 .forEach(resource -> nodes.add(new DiffNode("resource:L:" + resource.path(), resource.path(),
-                        EntityKind.RESOURCE, resource.id(), null, Set.of(ChangeKind.REMOVED))));
+                        EntityKind.RESOURCE, resource.id(), null, Set.of(ChangeKind.REMOVED),
+                        resolution(resource.id(), true, overrides))));
         right.values().stream()
                 .filter(resource -> !common.contains(resource.path()) && !movedRight.contains(resource.path()))
                 .forEach(resource -> nodes.add(new DiffNode("resource:R:" + resource.path(), resource.path(),
-                        EntityKind.RESOURCE, null, resource.id(), Set.of(ChangeKind.ADDED))));
+                        EntityKind.RESOURCE, null, resource.id(), Set.of(ChangeKind.ADDED),
+                        resolution(resource.id(), false, overrides))));
+    }
+
+    private static ResolutionStatus resolution(EntityId id, boolean left, ComparisonOverrides overrides) {
+        if (left && overrides.confirmedRemoved().contains(id)) {
+            return ResolutionStatus.CONFIRMED_REMOVED;
+        }
+        if (!left && overrides.confirmedAdded().contains(id)) {
+            return ResolutionStatus.CONFIRMED_ADDED;
+        }
+        return ResolutionStatus.NONE;
     }
 
     private static Map<String, List<ResourceModel>> indexByHash(List<ResourceModel> resources) {

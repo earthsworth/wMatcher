@@ -23,6 +23,8 @@ class JacksonProjectRepositoryTest {
                 21,
                 "conservative-v1",
                 Map.of(EntityId.classId("old/A"), EntityId.classId("new/B")),
+                Set.of(EntityId.resourceId("removed.txt")),
+                Set.of(EntityId.resourceId("added.txt")),
                 new ProjectUiState("needle", Set.of("CHANGED"), "entity:L:CLASS:old/A",
                         Set.of("root:classes", "package:classes:old"), 120, 285));
         Path path = temporaryDirectory.resolve("sample.wmatch");
@@ -58,6 +60,8 @@ class JacksonProjectRepositoryTest {
                 "status:changed", "status:changed:classes",
                 "status:unmatched", "status:unmatched:classes");
         assertThat(restored.uiState().navigationDividerLocation()).isEqualTo(340);
+        assertThat(restored.confirmedRemoved()).isEmpty();
+        assertThat(restored.confirmedAdded()).isEmpty();
     }
 
     @Test

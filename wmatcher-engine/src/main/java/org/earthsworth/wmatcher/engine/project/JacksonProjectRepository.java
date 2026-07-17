@@ -11,6 +11,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
@@ -46,6 +47,10 @@ public final class JacksonProjectRepository implements ProjectRepository {
                 file.targetRelease(),
                 file.matchingPolicy(),
                 mappings,
+                file.confirmedRemoved().stream().map(EntityFile::toEntityId)
+                        .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new)),
+                file.confirmedAdded().stream().map(EntityFile::toEntityId)
+                        .collect(java.util.stream.Collectors.toCollection(java.util.LinkedHashSet::new)),
                 file.uiState());
     }
 
@@ -57,6 +62,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
                 .sorted(Map.Entry.comparingByKey(Comparator.comparing(EntityId::externalName)))
                 .map(entry -> new MappingPairFile(EntityFile.from(entry.getKey()), EntityFile.from(entry.getValue())))
                 .toList();
+        List<EntityFile> confirmedRemoved = entityFiles(project.confirmedRemoved());
+        List<EntityFile> confirmedAdded = entityFiles(project.confirmedAdded());
         ProjectFile file = new ProjectFile(
                 project.formatVersion(),
                 project.left(),
@@ -64,6 +71,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
                 project.targetRelease(),
                 project.matchingPolicy(),
                 mappings,
+                confirmedRemoved,
+                confirmedAdded,
                 project.uiState());
         Path temporary = destination.resolveSibling(destination.getFileName() + ".tmp-" + UUID.randomUUID());
         try {
@@ -78,6 +87,13 @@ public final class JacksonProjectRepository implements ProjectRepository {
         }
     }
 
+    private static List<EntityFile> entityFiles(Set<EntityId> entities) {
+        return entities.stream()
+                .sorted(Comparator.comparing(EntityId::externalName).thenComparing(EntityId::kind))
+                .map(EntityFile::from)
+                .toList();
+    }
+
     public record ProjectFile(
             int formatVersion,
             ArtifactReference left,
@@ -85,9 +101,13 @@ public final class JacksonProjectRepository implements ProjectRepository {
             int targetRelease,
             String matchingPolicy,
             List<MappingPairFile> mappings,
+            List<EntityFile> confirmedRemoved,
+            List<EntityFile> confirmedAdded,
             ProjectUiState uiState) {
         public ProjectFile {
             mappings = mappings == null ? List.of() : List.copyOf(mappings);
+            confirmedRemoved = confirmedRemoved == null ? List.of() : List.copyOf(confirmedRemoved);
+            confirmedAdded = confirmedAdded == null ? List.of() : List.copyOf(confirmedAdded);
         }
     }
 

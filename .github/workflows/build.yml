@@ -21,9 +21,18 @@ jobs:
           distribution: zulu
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build and test
+      - name: Verify Gradle Wrapper permissions
+        if: runner.os != 'Windows'
+        shell: bash
+        run: test -x ./gradlew
+      - name: Build and test (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: ./gradlew clean check shadowJar
+      - name: Build and test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\gradlew.bat clean check shadowJar
       - name: Upload runnable Jar
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
