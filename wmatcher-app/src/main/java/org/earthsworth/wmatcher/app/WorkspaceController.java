@@ -528,8 +528,9 @@ public final class WorkspaceController implements AutoCloseable {
         Workspace current = requireWorkspace();
         return executor.submit(() -> {
             try {
-                String query = request.query().trim().toLowerCase(java.util.Locale.ROOT);
+                String query = request.query().trim();
                 if (query.isBlank()) return;
+                java.util.function.Predicate<String> matcher = request.matcher().predicate(query);
                 List<ArtifactSnapshot> artifacts = switch (request.side()) {
                     case OLD -> List.of(current.left());
                     case NEW -> List.of(current.right());
@@ -544,7 +545,7 @@ public final class WorkspaceController implements AutoCloseable {
                         for (var model : artifact.classes().values().stream()
                                 .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ClassModel::internalName))
                                 .toList()) {
-                            if (matches(query, model.internalName()) || matches(query, model.internalName().replace('/', '.'))) {
+                            if (matcher.test(model.internalName()) || matcher.test(model.internalName().replace('/', '.'))) {
                                 hit.accept(new SearchHit(leftSide, SearchType.CLASS, model.id(), model.internalName(), 0, ""));
                             }
                             completed++;
@@ -556,7 +557,7 @@ public final class WorkspaceController implements AutoCloseable {
                                 .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ClassModel::internalName))
                                 .toList()) {
                             for (var field : model.fields()) {
-                                if (matches(query, field.name()) || matches(query, field.descriptor())) {
+                                if (matcher.test(field.name()) || matcher.test(field.descriptor())) {
                                     hit.accept(new SearchHit(leftSide, SearchType.MEMBER,
                                             EntityId.fieldId(model.internalName(), field.name(), field.descriptor()),
                                             model.internalName() + "." + field.name(), 0,
@@ -564,7 +565,7 @@ public final class WorkspaceController implements AutoCloseable {
                                 }
                             }
                             for (var method : model.methods()) {
-                                if (matches(query, method.name()) || matches(query, method.descriptor())) {
+                                if (matcher.test(method.name()) || matcher.test(method.descriptor())) {
                                     hit.accept(new SearchHit(leftSide, SearchType.MEMBER,
                                             EntityId.methodId(model.internalName(), method.name(), method.descriptor()),
                                             model.internalName() + "." + method.name(), 0,
@@ -579,7 +580,7 @@ public final class WorkspaceController implements AutoCloseable {
                         for (var resource : artifact.resources().values().stream()
                                 .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ResourceModel::path))
                                 .toList()) {
-                            if (matches(query, resource.path())) {
+                            if (matcher.test(resource.path())) {
                                 hit.accept(new SearchHit(leftSide, SearchType.FILE, resource.id(), resource.path(), 0, ""));
                             }
                             completed++;
@@ -587,7 +588,7 @@ public final class WorkspaceController implements AutoCloseable {
                         }
                     }
                     if (request.types().contains(SearchType.TEXT)) {
-                        completed = searchText(current, artifact, leftSide, query, request.canonical(), hit, progress,
+                        completed = searchText(current, artifact, leftSide, matcher, request.canonical(), hit, progress,
                                 completed, total, request.cancellation());
                     }
                 }
@@ -601,7 +602,7 @@ public final class WorkspaceController implements AutoCloseable {
             Workspace current,
             ArtifactSnapshot artifact,
             boolean leftSide,
-            String query,
+            java.util.function.Predicate<String> matcher,
             boolean canonical,
             Consumer<SearchHit> hit,
             Consumer<SearchProgress> progress,
@@ -614,7 +615,7 @@ public final class WorkspaceController implements AutoCloseable {
             cancellation.throwIfCancelled();
             ResourceContent content = inspector.resourceContent(artifact, resource.path(), 5 * 1024 * 1024);
             emitTextHits(leftSide, resource.id(), resource.path(), new String(content.bytes(), StandardCharsets.UTF_8),
-                    query, SearchType.TEXT, hit);
+                    matcher, SearchType.TEXT, hit);
             progress.accept(new SearchProgress(++completed, total));
         }
         Set<String> topLevels = new java.util.TreeSet<>();
@@ -628,7 +629,7 @@ public final class WorkspaceController implements AutoCloseable {
                         current.matches().confirmedMappings(), canonical && !leftSide,
                         leftSide ? current.leftLibraries() : current.rightLibraries());
                 String sourceText = decompiler.decompile(request, cancellation).source();
-                emitTextHits(leftSide, classId, className, sourceText, query, SearchType.TEXT, hit);
+                emitTextHits(leftSide, classId, className, sourceText, matcher, SearchType.TEXT, hit);
             } catch (IOException ignored) {
                 // A single damaged class should not hide results from the rest of the artifact.
             }
@@ -642,19 +643,15 @@ public final class WorkspaceController implements AutoCloseable {
             EntityId id,
             String path,
             String value,
-            String query,
+            java.util.function.Predicate<String> matcher,
             SearchType type,
             Consumer<SearchHit> hit) {
         String[] lines = value.split("\\R", -1);
         for (int index = 0; index < lines.length; index++) {
-            if (matches(query, lines[index])) {
+            if (matcher.test(lines[index])) {
                 hit.accept(new SearchHit(leftSide, type, id, path, index + 1, lines[index].strip()));
             }
         }
-    }
-
-    private static boolean matches(String query, String value) {
-        return value != null && value.toLowerCase(java.util.Locale.ROOT).contains(query);
     }
 
     public void exportMappings(
@@ -1196,16 +1193,27 @@ public final class WorkspaceController implements AutoCloseable {
 
     public record SearchRequest(
             String query,
+            SearchMatcher matcher,
             SearchSide side,
             Set<SearchType> types,
             boolean canonical,
             CancellationToken cancellation) {
         public SearchRequest {
             query = query == null ? "" : query;
+            matcher = matcher == null ? SearchMatcher.CONTAINS_IGNORE_CASE : matcher;
             side = side == null ? SearchSide.ALL : side;
             types = types == null || types.isEmpty() ? Set.of(SearchType.CLASS, SearchType.MEMBER,
                     SearchType.FILE, SearchType.TEXT) : Set.copyOf(types);
             cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
+        }
+
+        public SearchRequest(
+                String query,
+                SearchSide side,
+                Set<SearchType> types,
+                boolean canonical,
+                CancellationToken cancellation) {
+            this(query, SearchMatcher.CONTAINS_IGNORE_CASE, side, types, canonical, cancellation);
         }
     }
 

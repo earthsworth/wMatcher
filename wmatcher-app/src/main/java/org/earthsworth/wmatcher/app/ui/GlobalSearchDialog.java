@@ -43,6 +43,7 @@ public final class GlobalSearchDialog extends JDialog {
     private final Consumer<WorkspaceController.SearchHit> navigator;
     private final Supplier<Boolean> canonical;
     private final JTextField query = new JTextField();
+    private final SearchMatcherSelect matcher = new SearchMatcherSelect(ignored -> schedule());
     private final JComboBox<SideChoice> side = new JComboBox<>();
     private final JCheckBox classes = new JCheckBox(text("search.classes"), true);
     private final JCheckBox members = new JCheckBox(text("search.members"), true);
@@ -100,7 +101,10 @@ public final class GlobalSearchDialog extends JDialog {
         side.addItem(new SideChoice(text("search.sideNew"), WorkspaceController.SearchSide.NEW));
         side.addActionListener(event -> schedule());
         panel.add(query, BorderLayout.CENTER);
-        panel.add(side, BorderLayout.EAST);
+        JPanel options = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        options.add(matcher);
+        options.add(side);
+        panel.add(options, BorderLayout.EAST);
         JPanel scopes = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         for (JCheckBox option : List.of(classes, members, files, textSearch)) {
             option.addActionListener(event -> schedule());
@@ -161,7 +165,7 @@ public final class GlobalSearchDialog extends JDialog {
         cancellation = new AtomicBoolean();
         progress.setVisible(true);
         status.setText(text("search.searching"));
-        var request = new WorkspaceController.SearchRequest(value,
+        var request = new WorkspaceController.SearchRequest(value, matcher.matcher(),
                 selectedSide == null ? WorkspaceController.SearchSide.ALL : selectedSide.side(),
                 types, canonical.get(), cancellation::get);
         job = controller.search(request,

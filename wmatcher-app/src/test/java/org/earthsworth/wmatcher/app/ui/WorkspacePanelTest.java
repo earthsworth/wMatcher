@@ -47,6 +47,36 @@ class WorkspacePanelTest {
     }
 
     @Test
+    void treeSearchUsesCaseSensitiveContainsMatching() throws Exception {
+        EntityId alpha = EntityId.classId("Alpha");
+        EntityId alphaBeta = EntityId.classId("AlphaBeta");
+        DiffNode alphaNode = new DiffNode("alpha", "Alpha", EntityKind.CLASS,
+                alpha, null, java.util.Set.of(ChangeKind.UNRESOLVED));
+        DiffNode alphaBetaNode = new DiffNode("alpha-beta", "AlphaBeta", EntityKind.CLASS,
+                alphaBeta, null, java.util.Set.of(ChangeKind.UNRESOLVED));
+        WorkspaceController.Workspace workspace = new WorkspaceController.Workspace(
+                snapshot("left.jar"), snapshot("right.jar"),
+                new MatchResult(List.of(), Map.of(), java.util.Set.of(alpha, alphaBeta), java.util.Set.of()),
+                new DiffResult(List.of(alphaNode, alphaBetaNode), Map.of()), Map.of(),
+                List.of(), List.of(), null, "", ProjectUiState.empty());
+        WorkspaceController controller = new WorkspaceController();
+        AtomicPanel result = new AtomicPanel();
+
+        SwingUtilities.invokeAndWait(() -> {
+            result.panel = new WorkspacePanel(controller, workspace, ignored -> { });
+            result.panel.searchForTesting().setText("Alpha");
+        });
+
+        assertThat(result.panel.stableTreeKeysForTesting()).contains(
+                "entity:L:CLASS:Alpha", "entity:L:CLASS:AlphaBeta");
+
+        SwingUtilities.invokeAndWait(() -> result.panel.searchForTesting().setText("alpha"));
+        assertThat(result.panel.stableTreeKeysForTesting()).doesNotContain(
+                "entity:L:CLASS:Alpha", "entity:L:CLASS:AlphaBeta");
+        controller.close();
+    }
+
+    @Test
     void summaryCountsOnlyClassLevelMatchesCandidatesAndChanges() throws Exception {
         EntityId oldClass = EntityId.classId("old/Owner");
         EntityId newClass = EntityId.classId("new/Owner");

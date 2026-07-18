@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
@@ -58,6 +59,7 @@ import javax.swing.tree.DefaultMutableTreeNode;
 import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
+import org.earthsworth.wmatcher.app.SearchMatcher;
 import org.earthsworth.wmatcher.app.WorkspaceController;
 import org.earthsworth.wmatcher.core.model.ChangeKind;
 import org.earthsworth.wmatcher.core.model.ClassClassification;
@@ -115,6 +117,7 @@ public final class WorkspacePanel extends JPanel {
     private boolean mappingBusy;
     private List<TreeItem> allItems = List.of();
     private final Map<String, DefaultMutableTreeNode> treeNodeIndex = new HashMap<>();
+    private Predicate<String> treeSearchPredicate = ignored -> true;
 
     public WorkspacePanel(
             WorkspaceController controller,
@@ -332,9 +335,9 @@ public final class WorkspacePanel extends JPanel {
             return;
         }
         node.removeAllChildren();
-        String query = search.getText().trim().toLowerCase(Locale.ROOT);
+        String query = search.getText().trim();
         entry.members().stream()
-                .filter(member -> query.isEmpty() || memberMatches(member, query))
+                .filter(member -> query.isEmpty() || memberMatches(member, treeSearchPredicate))
                 .forEach(member -> node.add(memberNode(member)));
         ((DefaultTreeModel) tree.getModel()).reload(node);
         SwingUtilities.invokeLater(() -> tree.expandPath(path));
@@ -383,6 +386,7 @@ public final class WorkspacePanel extends JPanel {
     }
 
     private void rebuildTree(String selectedKey) {
+        treeSearchPredicate = prepareSearchPredicate();
         DefaultMutableTreeNode root = new DefaultMutableTreeNode("root");
         String effectiveSelection = selectedKey.isBlank() && selected != null ? stableNodeKey(selected) : selectedKey;
         int effectiveScroll = treeScrollPane.getVerticalScrollBar().getValue();
@@ -512,7 +516,7 @@ public final class WorkspacePanel extends JPanel {
 
     private void addClasses(String namespace, DefaultMutableTreeNode classRoot, List<TreeItem> items) {
         Map<String, DefaultMutableTreeNode> packages = new HashMap<>();
-        String query = search.getText().trim().toLowerCase(Locale.ROOT);
+        String query = search.getText().trim();
         items.forEach(item -> {
             DiffNode node = item.node();
             String className = entityName(node);
@@ -530,7 +534,7 @@ public final class WorkspacePanel extends JPanel {
                     classNode.add(new DefaultMutableTreeNode(new TreeEntry(
                             "placeholder:" + stableNodeKey(node), "…", null)));
                 } else {
-                    item.members().stream().filter(member -> memberMatches(member, query))
+                    item.members().stream().filter(member -> memberMatches(member, treeSearchPredicate))
                             .forEach(member -> classNode.add(memberNode(member)));
                 }
             }
@@ -565,9 +569,8 @@ public final class WorkspacePanel extends JPanel {
 
     private boolean visible(TreeItem item) {
         DiffNode node = item.node();
-        String query = search.getText().trim().toLowerCase(Locale.ROOT);
-        if (!query.isEmpty() && !node.displayName().toLowerCase(Locale.ROOT).contains(query)
-                && item.members().stream().noneMatch(member -> memberMatches(member, query))) {
+        if (!treeSearchPredicate.test(node.displayName())
+                && item.members().stream().noneMatch(member -> memberMatches(member, treeSearchPredicate))) {
             return false;
         }
         FilterOption option = (FilterOption) filter.getSelectedItem();
@@ -582,10 +585,18 @@ public final class WorkspacePanel extends JPanel {
         };
     }
 
-    private static boolean memberMatches(DiffNode member, String query) {
-        return member.displayName().toLowerCase(Locale.ROOT).contains(query)
-                || (member.left() != null && member.left().externalName().toLowerCase(Locale.ROOT).contains(query))
-                || (member.right() != null && member.right().externalName().toLowerCase(Locale.ROOT).contains(query));
+    private Predicate<String> prepareSearchPredicate() {
+        String query = search.getText().trim();
+        if (query.isEmpty()) {
+            return ignored -> true;
+        }
+        return SearchMatcher.CONTAINS.predicate(query);
+    }
+
+    private static boolean memberMatches(DiffNode member, Predicate<String> matcher) {
+        return matcher.test(member.displayName())
+                || (member.left() != null && matcher.test(member.left().externalName()))
+                || (member.right() != null && matcher.test(member.right().externalName()));
     }
 
     private static boolean hasChange(TreeItem item, ChangeKind kind) {
