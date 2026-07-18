@@ -16,6 +16,7 @@ public final class AppPreferences {
     private static final String LANGUAGE = "language";
     private static final String THEME = "theme";
     private static final String MINIMAP_VISIBLE = "minimapVisible";
+    private static final String SHORTCUT_PREFIX = "shortcut.";
     private static final String RECENT_PROJECT = "recentProject";
     private static final String RECENT_PATH = "recent.path.";
     private static final String RECENT_TIME = "recent.time.";
@@ -67,6 +68,32 @@ public final class AppPreferences {
 
     public static void setMinimapVisible(boolean visible) {
         setMinimapVisible(PREFERENCES, visible);
+    }
+
+    public static String shortcut(String id) {
+        return PREFERENCES.get(SHORTCUT_PREFIX + id, "");
+    }
+
+    public static void setShortcut(String id, String stroke) {
+        if (stroke == null || stroke.isBlank()) {
+            PREFERENCES.remove(SHORTCUT_PREFIX + id);
+        } else {
+            PREFERENCES.put(SHORTCUT_PREFIX + id, stroke);
+        }
+        flushPreferences();
+    }
+
+    public static void clearShortcut(String id) {
+        PREFERENCES.remove(SHORTCUT_PREFIX + id);
+        flushPreferences();
+    }
+
+    private static void flushPreferences() {
+        try {
+            PREFERENCES.flush();
+        } catch (BackingStoreException exception) {
+            throw new IllegalStateException("Unable to save application preference", exception);
+        }
     }
 
     public static Optional<Path> recentProject() {

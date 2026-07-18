@@ -11,6 +11,7 @@ import java.awt.Window;
 import java.awt.datatransfer.StringSelection;
 import java.net.URI;
 import javax.swing.BorderFactory;
+import javax.swing.AbstractAction;
 import javax.swing.JButton;
 import javax.swing.JDialog;
 import javax.swing.JEditorPane;
@@ -18,8 +19,12 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JTextArea;
 import javax.swing.UIManager;
+import javax.swing.JRootPane;
+import javax.swing.KeyStroke;
 import javax.swing.event.HyperlinkEvent;
 import org.earthsworth.wmatcher.app.AppMetadata;
+import org.earthsworth.wmatcher.app.ShortcutId;
+import org.earthsworth.wmatcher.app.ShortcutManager;
 
 public final class AboutDialog extends JDialog {
     public AboutDialog(Window owner) {
@@ -38,6 +43,11 @@ public final class AboutDialog extends JDialog {
         content.add(link(), BorderLayout.CENTER);
         content.add(actions(), BorderLayout.SOUTH);
         setContentPane(content);
+        getRootPane().getInputMap(JRootPane.WHEN_IN_FOCUSED_WINDOW)
+                .put(ShortcutManager.stroke(ShortcutId.CLOSE_CHILD), "close");
+        getRootPane().getActionMap().put("close", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { dispose(); }
+        });
         pack();
         setLocationRelativeTo(owner);
     }

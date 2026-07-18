@@ -9,6 +9,8 @@ import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.EnumMap;
+import java.util.Map;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBoxMenuItem;
@@ -23,10 +25,16 @@ import javax.swing.JPanel;
 import javax.swing.JProgressBar;
 import javax.swing.WindowConstants;
 import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.filechooser.FileFilter;
 import org.earthsworth.wmatcher.app.ui.AboutDialog;
 import org.earthsworth.wmatcher.app.ui.NewProjectDialog;
 import org.earthsworth.wmatcher.app.ui.StartPanel;
 import org.earthsworth.wmatcher.app.ui.WorkspacePanel;
+import org.earthsworth.wmatcher.app.ui.NamespaceDialog;
+import org.earthsworth.wmatcher.app.ui.ShortcutSettingsDialog;
+import org.earthsworth.wmatcher.app.ui.GlobalSearchDialog;
+import org.earthsworth.wmatcher.core.model.MappingFileFormat;
+import org.earthsworth.wmatcher.core.model.MappingNamespaces;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,6 +51,7 @@ public final class MainFrame extends JFrame {
     private final UnsavedChangesGuard unsavedChangesGuard = new UnsavedChangesGuard();
     private StartPanel startPanel;
     private WorkspacePanel workspacePanel;
+    private final Map<ShortcutId, javax.swing.KeyStroke> installedShortcuts = new EnumMap<>(ShortcutId.class);
 
     public MainFrame(WorkspaceController controller) {
         super(text("app.title"));
@@ -63,21 +72,29 @@ public final class MainFrame extends JFrame {
         });
         controller.addDocumentStateListener(ignored -> updateWindowTitle());
         showWelcome();
+        installGlobalShortcuts();
         updateWindowTitle();
     }
 
     private JMenuBar menuBar() {
         JMenuBar bar = new JMenuBar();
         JMenu file = new JMenu(text("menu.file"));
-        file.add(item(text("menu.new"), this::requestNewProject));
-        file.add(item(text("menu.open"), this::requestOpenProject));
+        file.add(item(text("menu.new"), this::requestNewProject, ShortcutId.NEW_PROJECT));
+        file.add(item(text("menu.open"), this::requestOpenProject, ShortcutId.OPEN_PROJECT));
         file.addSeparator();
-        file.add(item(text("menu.save"), () -> saveProject(false)));
-        file.add(item(text("menu.saveAs"), () -> saveProject(true)));
+        file.add(item(text("menu.save"), () -> saveProject(false), ShortcutId.SAVE_PROJECT));
+        file.add(item(text("menu.saveAs"), () -> saveProject(true), ShortcutId.SAVE_AS));
         file.addSeparator();
-        file.add(item(text("menu.importTiny"), this::importTiny));
-        file.add(item(text("menu.importProguard"), this::importProguard));
-        file.add(item(text("menu.exportTiny"), this::exportTiny));
+        JMenu imports = new JMenu(text("menu.importMappings"));
+        for (MappingFileFormat format : MappingFileFormat.values()) {
+            imports.add(item(mappingLabel(format), () -> importMapping(format)));
+        }
+        JMenu exports = new JMenu(text("menu.exportMappings"));
+        for (MappingFileFormat format : MappingFileFormat.values()) {
+            exports.add(item(mappingLabel(format), () -> exportMapping(format)));
+        }
+        file.add(imports);
+        file.add(exports);
         file.addSeparator();
         file.add(item(text("menu.exit"), this::requestShutdown));
         bar.add(file);
@@ -85,10 +102,18 @@ public final class MainFrame extends JFrame {
         JMenu edit = new JMenu(text("menu.edit"));
         edit.add(item(text("menu.undo"), () -> {
             if (workspacePanel != null) workspacePanel.undo();
-        }));
+        }, ShortcutId.UNDO));
         edit.add(item(text("menu.redo"), () -> {
             if (workspacePanel != null) workspacePanel.redo();
-        }));
+        }, ShortcutId.REDO));
+        edit.add(item(text("menu.globalSearch"), this::showGlobalSearch, ShortcutId.GLOBAL_SEARCH));
+        edit.addSeparator();
+        edit.add(item(text("menu.shortcuts"), () -> new ShortcutSettingsDialog(this, () -> {
+            setJMenuBar(menuBar());
+            installGlobalShortcuts();
+            if (workspacePanel != null) workspacePanel.refreshShortcuts();
+            if (startPanel != null) startPanel.refreshShortcuts();
+        }).setVisible(true)));
         bar.add(edit);
 
         JMenu view = new JMenu(text("menu.view"));
@@ -253,37 +278,60 @@ public final class MainFrame extends JFrame {
         }, this::showError);
     }
 
-    private void importTiny() {
+    private void importMapping(MappingFileFormat format) {
         if (controller.workspace() == null) return;
-        JFileChooser chooser = chooser(text("dialog.importTiny"), "Tiny v2 mappings (*.tiny)", "tiny");
-        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-            controller.importTiny(chooser.getSelectedFile().toPath(), workspace -> {
+        JFileChooser chooser = mappingChooser(text("dialog.importMapping"), format, true);
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path path = chooser.getSelectedFile().toPath().toAbsolutePath().normalize();
+        controller.mappingNamespaces(path, format, namespaces -> {
+            MappingNamespaces selected = selectNamespaces(format, namespaces);
+            if (namespaces.size() > 2 && selected == null) return;
+            controller.importMappingFile(format, path, selected, (workspace, result) -> {
                 workspacePanel.refresh(workspace);
-                status.setText(text("message.imported"));
+                status.setText(text("message.importedMappings", result.imported(), result.skipped()));
             }, this::showError);
-        }
+        }, this::showError);
     }
 
-    private void importProguard() {
+    private void exportMapping(MappingFileFormat format) {
         if (controller.workspace() == null) return;
-        JFileChooser leftChooser = chooser(text("dialog.leftProguard"), "ProGuard/R8 mappings (*.txt, *.map)", "txt", "map");
-        if (leftChooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
-        JFileChooser rightChooser = chooser(text("dialog.rightProguard"), "ProGuard/R8 mappings (*.txt, *.map)", "txt", "map");
-        if (rightChooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
-        controller.importProguard(leftChooser.getSelectedFile().toPath(), rightChooser.getSelectedFile().toPath(),
-                workspace -> {
-                    workspacePanel.refresh(workspace);
-                    status.setText(text("message.imported"));
-                }, this::showError);
+        JFileChooser chooser = mappingChooser(text("dialog.exportMapping"), format, false);
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        Path path = chooser.getSelectedFile().toPath().toAbsolutePath().normalize();
+        if (format == MappingFileFormat.ENIGMA && java.nio.file.Files.isDirectory(path)
+                && JOptionPane.showConfirmDialog(this, text("dialog.replaceMappingDirectory"),
+                text("dialog.exportMapping"), JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) {
+            return;
+        }
+        if (format != MappingFileFormat.ENIGMA || !java.nio.file.Files.isDirectory(path)) {
+            path = withExtension(path, mappingExtension(format));
+        }
+        Path destination = path;
+        controller.exportMappings(destination, format,
+                () -> status.setText(text("message.exportedMappings", mappingLabel(format))), this::showError);
     }
 
-    private void exportTiny() {
-        if (controller.workspace() == null) return;
-        JFileChooser chooser = chooser(text("dialog.exportTiny"), "Tiny v2 mappings (*.tiny)", "tiny");
-        if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
-            Path path = withExtension(chooser.getSelectedFile().toPath(), ".tiny");
-            controller.exportTiny(path, () -> status.setText(text("message.exported")), this::showError);
-        }
+    private MappingNamespaces selectNamespaces(MappingFileFormat format, java.util.List<String> namespaces) {
+        if (format != MappingFileFormat.TINY_V1 && format != MappingFileFormat.TINY_V2) return null;
+        if (namespaces.size() < 2) return null;
+        if (namespaces.size() == 2) return new MappingNamespaces(namespaces.getFirst(), namespaces.get(1));
+        return NamespaceDialog.showDialog(this, namespaces);
+    }
+
+    private static String mappingLabel(MappingFileFormat format) {
+        return text("mapping.format." + format.name().toLowerCase(Locale.ROOT));
+    }
+
+    private static String mappingExtension(MappingFileFormat format) {
+        return switch (format) {
+            case ENIGMA -> ".mapping";
+            case JADX_LEGACY -> ".jobf";
+            case PROGUARD -> ".txt";
+            case SRG -> ".srg";
+            case SIMPLE -> ".txt";
+            case TINY_V1, TINY_V2 -> ".tiny";
+        };
     }
 
     private void setLanguage(Locale locale) {
@@ -362,6 +410,46 @@ public final class MainFrame extends JFrame {
         setTitle(text("app.title") + (controller.hasUnsavedChanges() ? " *" : ""));
     }
 
+    private void installGlobalShortcuts() {
+        javax.swing.InputMap input = getRootPane().getInputMap(javax.swing.JComponent.WHEN_IN_FOCUSED_WINDOW);
+        javax.swing.ActionMap actions = getRootPane().getActionMap();
+        installedShortcuts.forEach((id, stroke) -> input.remove(stroke));
+        installedShortcuts.clear();
+        bindGlobal(input, actions, ShortcutId.GLOBAL_SEARCH, this::showGlobalSearch);
+        bindGlobal(input, actions, ShortcutId.FOCUS_TREE,
+                () -> { if (workspacePanel != null) workspacePanel.focusTree(); });
+        bindGlobal(input, actions, ShortcutId.TAB_OVERVIEW,
+                () -> { if (workspacePanel != null) workspacePanel.selectDetailTab(0); });
+        bindGlobal(input, actions, ShortcutId.TAB_CANDIDATES,
+                () -> { if (workspacePanel != null) workspacePanel.selectDetailTab(1); });
+        bindGlobal(input, actions, ShortcutId.TAB_STRUCTURE,
+                () -> { if (workspacePanel != null) workspacePanel.selectDetailTab(2); });
+        bindGlobal(input, actions, ShortcutId.TAB_BYTECODE,
+                () -> { if (workspacePanel != null) workspacePanel.selectDetailTab(3); });
+        bindGlobal(input, actions, ShortcutId.TAB_SOURCE,
+                () -> { if (workspacePanel != null) workspacePanel.selectDetailTab(4); });
+    }
+
+    private void showGlobalSearch() {
+        if (controller.workspace() == null || workspacePanel == null) return;
+        new GlobalSearchDialog(this, controller, workspacePanel::navigateToSearchHit,
+                workspacePanel::canonicalNamesEnabled).setVisible(true);
+    }
+
+    private void bindGlobal(
+            javax.swing.InputMap input,
+            javax.swing.ActionMap actions,
+            ShortcutId id,
+            Runnable action) {
+        javax.swing.KeyStroke stroke = ShortcutManager.stroke(id);
+        String actionKey = "shortcut." + id.name();
+        input.put(stroke, actionKey);
+        actions.put(actionKey, new javax.swing.AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { action.run(); }
+        });
+        installedShortcuts.put(id, stroke);
+    }
+
     private void setSaving() {
         progress.setVisible(true);
         progress.setIndeterminate(true);
@@ -375,10 +463,40 @@ public final class MainFrame extends JFrame {
         return item;
     }
 
+    private static JMenuItem item(String label, Runnable action, ShortcutId shortcut) {
+        JMenuItem item = item(label, action);
+        item.setAccelerator(ShortcutManager.stroke(shortcut));
+        return item;
+    }
+
     private static JFileChooser chooser(String title, String description, String... extensions) {
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle(title);
         chooser.setFileFilter(new FileNameExtensionFilter(description, extensions));
+        return chooser;
+    }
+
+    private static JFileChooser mappingChooser(String title, MappingFileFormat format, boolean open) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle(title);
+        if (format == MappingFileFormat.ENIGMA) {
+            chooser.setFileSelectionMode(JFileChooser.FILES_AND_DIRECTORIES);
+        } else {
+            chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+        }
+        String extension = mappingExtension(format);
+        chooser.setFileFilter(new FileFilter() {
+            @Override
+            public boolean accept(java.io.File file) {
+                if (file.isDirectory()) return format == MappingFileFormat.ENIGMA;
+                return file.getName().toLowerCase(Locale.ROOT).endsWith(extension);
+            }
+
+            @Override
+            public String getDescription() {
+                return text("mapping.filter", mappingLabel(format));
+            }
+        });
         return chooser;
     }
 

@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.earthsworth.wmatcher.core.model.ScanOptions;
@@ -48,5 +49,24 @@ class JarArtifactLoaderTest {
                 jar, limits, ProgressListener.NONE, CancellationToken.NONE))
                 .isInstanceOf(java.io.IOException.class)
                 .hasMessageContaining("1 GiB");
+    }
+
+    @Test
+    void readsArtifactDirectoryWithTheSameLogicalView() throws Exception {
+        Path root = temporaryDirectory.resolve("classes");
+        Files.createDirectories(root.resolve("sample"));
+        Files.createDirectories(root.resolve("META-INF"));
+        Files.write(root.resolve("sample/Example.class"),
+                TestArtifacts.simpleClass("sample/Example", "run", 8, 10));
+        Files.writeString(root.resolve("config.txt"), "hello=wMatcher\n");
+        Files.writeString(root.resolve("META-INF/MANIFEST.MF"), "Manifest-Version: 1.0\n");
+
+        var snapshot = new JarArtifactLoader().load(root, ScanOptions.productionDefaults(),
+                ProgressListener.NONE, CancellationToken.NONE);
+
+        assertThat(snapshot.classes()).containsOnlyKeys("sample/Example");
+        assertThat(snapshot.resources()).containsKey("config.txt");
+        assertThat(snapshot.path()).isEqualTo(root.toAbsolutePath().normalize());
+        assertThat(snapshot.sha256()).hasSize(64);
     }
 }

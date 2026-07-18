@@ -179,6 +179,27 @@ public final class WorkspacePanel extends JPanel {
         source.setMinimapVisible(visible);
     }
 
+    public void refreshShortcuts() {
+        structure.refreshShortcuts();
+        bytecode.refreshShortcuts();
+        source.refreshShortcuts();
+    }
+
+    public void focusTree() {
+        tree.requestFocusInWindow();
+    }
+
+    public boolean canonicalNamesEnabled() {
+        return canonical.isSelected();
+    }
+
+    public void selectDetailTab(int index) {
+        if (index >= 0 && index < tabs.getTabCount()) {
+            tabs.setSelectedIndex(index);
+            tabs.requestFocusInWindow();
+        }
+    }
+
     private void buildUi() {
         JPanel top = new JPanel(new BorderLayout());
         top.setBorder(BorderFactory.createEmptyBorder(7, 10, 7, 10));
@@ -628,6 +649,30 @@ public final class WorkspacePanel extends JPanel {
                     generation);
             bytecode.setTexts("", "");
             source.setTexts("", "");
+        }
+    }
+
+    public void navigateToSearchHit(WorkspaceController.SearchHit hit) {
+        if (hit == null || hit.entity() == null) return;
+        DiffNode node = workspace.differences().nodes().stream()
+                .filter(candidate -> hit.leftSide()
+                        ? hit.entity().equals(candidate.left()) : hit.entity().equals(candidate.right()))
+                .findFirst()
+                .orElseGet(() -> workspace.differences().nodes().stream()
+                        .filter(candidate -> candidate.kind() == EntityKind.CLASS
+                                && (hit.entity().owner().equals(candidate.left() == null ? "" : candidate.left().name())
+                                || hit.entity().owner().equals(candidate.right() == null ? "" : candidate.right().name())))
+                        .findFirst().orElse(null));
+        if (node == null) return;
+        selectNode(node);
+        if (hit.type() == WorkspaceController.SearchType.TEXT) {
+            if (hit.entity().kind() == EntityKind.RESOURCE) {
+                tabs.setSelectedIndex(STRUCTURE_TAB);
+                structure.revealLine(hit.leftSide(), hit.line());
+            } else {
+                tabs.setSelectedIndex(SOURCE_TAB);
+                source.revealLine(hit.leftSide(), hit.line());
+            }
         }
     }
 

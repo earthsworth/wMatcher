@@ -20,8 +20,6 @@ import java.util.Set;
 import java.util.concurrent.Semaphore;
 import java.util.jar.Manifest;
 import java.util.stream.Collectors;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ClassModel;
 import org.earthsworth.wmatcher.core.model.DecompileRequest;
@@ -31,6 +29,7 @@ import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.service.DecompilerService;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
 import org.earthsworth.wmatcher.engine.util.Hashing;
+import org.earthsworth.wmatcher.engine.jar.ArtifactContentReader;
 import org.jetbrains.java.decompiler.main.decompiler.BaseDecompiler;
 import org.jetbrains.java.decompiler.main.extern.IContextSource;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
@@ -122,7 +121,7 @@ public final class VineflowerDecompilerService implements DecompilerService {
         decompiler.addSource(source);
         decompiler.addLibrary(new LazyArtifactSource(artifact, remapper, sourceClasses.keySet()));
         for (Path library : request.libraries()) {
-            if (Files.isRegularFile(library)) {
+            if (Files.isRegularFile(library) || Files.isDirectory(library)) {
                 decompiler.addLibrary(library.toFile());
             }
         }
@@ -150,23 +149,7 @@ public final class VineflowerDecompilerService implements DecompilerService {
     }
 
     private static byte[] readClassBytes(ArtifactSnapshot artifact, ClassModel model) throws IOException {
-        try (ZipFile zip = new ZipFile(artifact.path().toFile())) {
-            ZipEntry entry = zip.getEntry(model.entryName());
-            if (entry == null) {
-                throw new IOException("Class entry is missing: " + model.entryName());
-            }
-            try (InputStream input = zip.getInputStream(entry); ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-                byte[] buffer = new byte[16 * 1024];
-                int read;
-                while ((read = input.read(buffer)) >= 0) {
-                    if (output.size() + read > 64 * 1024 * 1024) {
-                        throw new IOException("Class exceeds decompilation safety limit: " + model.entryName());
-                    }
-                    output.write(buffer, 0, read);
-                }
-                return output.toByteArray();
-            }
-        }
+        return ArtifactContentReader.read(artifact, model.entryName(), 64 * 1024 * 1024);
     }
 
     private static String topLevelName(String internalName) {

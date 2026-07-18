@@ -63,6 +63,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
                         decision -> ClassClassification.valueOf(decision.classification()),
                         (first, ignored) -> first,
                         java.util.LinkedHashMap::new)),
+                file.leftLibraries(),
+                file.rightLibraries(),
                 file.uiState());
     }
 
@@ -98,6 +100,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
                 confirmedAdded,
                 detachedMappings,
                 classifications,
+                project.leftLibraries(),
+                project.rightLibraries(),
                 project.uiState());
         Path temporary = destination.resolveSibling(destination.getFileName() + ".tmp-" + UUID.randomUUID());
         try {
@@ -130,6 +134,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
             List<EntityFile> confirmedAdded,
             List<MappingPairFile> detachedMappings,
             List<ClassClassificationFile> classifications,
+            List<String> leftLibraries,
+            List<String> rightLibraries,
             ProjectUiState uiState) {
         public ProjectFile {
             mappings = mappings == null ? List.of() : List.copyOf(mappings);
@@ -137,6 +143,8 @@ public final class JacksonProjectRepository implements ProjectRepository {
             confirmedAdded = confirmedAdded == null ? List.of() : List.copyOf(confirmedAdded);
             detachedMappings = detachedMappings == null ? List.of() : List.copyOf(detachedMappings);
             classifications = classifications == null ? List.of() : List.copyOf(classifications);
+            leftLibraries = leftLibraries == null ? List.of() : List.copyOf(leftLibraries);
+            rightLibraries = rightLibraries == null ? List.of() : List.copyOf(rightLibraries);
         }
     }
 

@@ -28,6 +28,8 @@ import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.table.AbstractTableModel;
 import org.earthsworth.wmatcher.core.model.EntityId;
+import org.earthsworth.wmatcher.app.ShortcutId;
+import org.earthsworth.wmatcher.app.ShortcutManager;
 
 final class ManualMatchDialog extends JDialog {
     private final List<Choice> allChoices;
@@ -121,11 +123,11 @@ final class ManualMatchDialog extends JDialog {
     }
 
     private void installKeyboardActions() {
-        search.getInputMap().put(KeyStroke.getKeyStroke("DOWN"), "next-result");
+        search.getInputMap().put(ShortcutManager.stroke(ShortcutId.DIALOG_NEXT), "next-result");
         search.getActionMap().put("next-result", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { moveSelection(1); }
         });
-        search.getInputMap().put(KeyStroke.getKeyStroke("UP"), "previous-result");
+        search.getInputMap().put(ShortcutManager.stroke(ShortcutId.DIALOG_PREVIOUS), "previous-result");
         search.getActionMap().put("previous-result", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { moveSelection(-1); }
         });
@@ -134,7 +136,7 @@ final class ManualMatchDialog extends JDialog {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { acceptSelection(); }
         });
         getRootPane().getInputMap(javax.swing.JComponent.WHEN_IN_FOCUSED_WINDOW)
-                .put(KeyStroke.getKeyStroke("ESCAPE"), "close");
+                .put(ShortcutManager.stroke(ShortcutId.CLOSE_CHILD), "close");
         getRootPane().getActionMap().put("close", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { dispose(); }
         });

@@ -21,6 +21,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import javax.swing.SwingUtilities;
 import org.earthsworth.wmatcher.core.model.ArtifactSnapshot;
 import org.earthsworth.wmatcher.core.model.ClassClassification;
@@ -35,6 +36,9 @@ import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.EntityKind;
 import org.earthsworth.wmatcher.core.model.MatchDecision;
 import org.earthsworth.wmatcher.core.model.MatchResult;
+import org.earthsworth.wmatcher.core.model.MappingFileFormat;
+import org.earthsworth.wmatcher.core.model.MappingImportResult;
+import org.earthsworth.wmatcher.core.model.MappingNamespaces;
 import org.earthsworth.wmatcher.core.model.MatchingUpdate;
 import org.earthsworth.wmatcher.core.model.MatchingPolicy;
 import org.earthsworth.wmatcher.core.model.ResourceContent;
@@ -194,8 +198,8 @@ public final class WorkspaceController implements AutoCloseable {
                         Path.of(project.left().path()),
                         Path.of(project.right().path()),
                         project.targetRelease(),
-                        List.of(),
-                        List.of(),
+                        project.leftLibraries().stream().map(Path::of).toList(),
+                        project.rightLibraries().stream().map(Path::of).toList(),
                         new ComparisonOverrides(project.lockedMappings(), project.confirmedRemoved(),
                                 project.confirmedAdded(), project.detachedPairs(), project.classifications()),
                         projectPath,
@@ -225,6 +229,8 @@ public final class WorkspaceController implements AutoCloseable {
                         current.confirmedAdded(),
                         current.overrides().detachedPairs(),
                         current.overrides().classifications(),
+                        current.leftLibraries().stream().map(Path::toString).toList(),
+                        current.rightLibraries().stream().map(Path::toString).toList(),
                         uiState);
                 projects.save(path, project);
                 Workspace latest = workspace;
@@ -469,6 +475,197 @@ public final class WorkspaceController implements AutoCloseable {
         executor.submit(() -> {
             try {
                 mappings.exportTiny(path, current.matches());
+                onEdt(success);
+            } catch (Throwable throwable) {
+                onEdt(() -> failure.accept(unwrap(throwable)));
+            }
+        });
+    }
+
+    public void importMappingFile(
+            MappingFileFormat format,
+            Path path,
+            MappingNamespaces namespaces,
+            BiConsumer<Workspace, MappingImportResult> success,
+            Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        executor.submit(() -> {
+            try {
+                MappingImportResult imported = mappings.importMappings(
+                        format, path, namespaces, current.left(), current.right());
+                Map<EntityId, EntityId> merged = mergeWithoutOverwriting(current.overrides(), imported.mappings());
+                ComparisonOverrides updated = new ComparisonOverrides(
+                        merged, current.confirmedRemoved(), current.confirmedAdded(),
+                        current.overrides().detachedPairs(), current.overrides().classifications());
+                pushAndRecompute(current.overrides(), updated,
+                        workspace -> success.accept(workspace, imported), failure);
+            } catch (Throwable throwable) {
+                onEdt(() -> failure.accept(unwrap(throwable)));
+            }
+        });
+    }
+
+    public void mappingNamespaces(
+            Path path,
+            MappingFileFormat format,
+            Consumer<List<String>> success,
+            Consumer<Throwable> failure) {
+        executor.submit(() -> {
+            try {
+                List<String> namespaces = mappings.namespaces(path, format);
+                onEdt(() -> success.accept(namespaces));
+            } catch (Throwable throwable) {
+                onEdt(() -> failure.accept(unwrap(throwable)));
+            }
+        });
+    }
+
+    public java.util.concurrent.Future<?> search(
+            SearchRequest request,
+            Consumer<SearchHit> hit,
+            Consumer<SearchProgress> progress,
+            Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        return executor.submit(() -> {
+            try {
+                String query = request.query().trim().toLowerCase(java.util.Locale.ROOT);
+                if (query.isBlank()) return;
+                List<ArtifactSnapshot> artifacts = switch (request.side()) {
+                    case OLD -> List.of(current.left());
+                    case NEW -> List.of(current.right());
+                    case ALL -> List.of(current.left(), current.right());
+                };
+                int total = artifacts.stream().mapToInt(artifact -> artifact.classes().size()
+                        + artifact.resources().size()).sum();
+                int completed = 0;
+                for (ArtifactSnapshot artifact : artifacts) {
+                    boolean leftSide = artifact == current.left();
+                    if (request.types().contains(SearchType.CLASS)) {
+                        for (var model : artifact.classes().values().stream()
+                                .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ClassModel::internalName))
+                                .toList()) {
+                            if (matches(query, model.internalName()) || matches(query, model.internalName().replace('/', '.'))) {
+                                hit.accept(new SearchHit(leftSide, SearchType.CLASS, model.id(), model.internalName(), 0, ""));
+                            }
+                            completed++;
+                            progress.accept(new SearchProgress(completed, total));
+                        }
+                    }
+                    if (request.types().contains(SearchType.MEMBER)) {
+                        for (var model : artifact.classes().values().stream()
+                                .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ClassModel::internalName))
+                                .toList()) {
+                            for (var field : model.fields()) {
+                                if (matches(query, field.name()) || matches(query, field.descriptor())) {
+                                    hit.accept(new SearchHit(leftSide, SearchType.MEMBER,
+                                            EntityId.fieldId(model.internalName(), field.name(), field.descriptor()),
+                                            model.internalName() + "." + field.name(), 0,
+                                            field.descriptor()));
+                                }
+                            }
+                            for (var method : model.methods()) {
+                                if (matches(query, method.name()) || matches(query, method.descriptor())) {
+                                    hit.accept(new SearchHit(leftSide, SearchType.MEMBER,
+                                            EntityId.methodId(model.internalName(), method.name(), method.descriptor()),
+                                            model.internalName() + "." + method.name(), 0,
+                                            method.descriptor()));
+                                }
+                            }
+                            completed++;
+                            progress.accept(new SearchProgress(completed, total));
+                        }
+                    }
+                    if (request.types().contains(SearchType.FILE)) {
+                        for (var resource : artifact.resources().values().stream()
+                                .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ResourceModel::path))
+                                .toList()) {
+                            if (matches(query, resource.path())) {
+                                hit.accept(new SearchHit(leftSide, SearchType.FILE, resource.id(), resource.path(), 0, ""));
+                            }
+                            completed++;
+                            progress.accept(new SearchProgress(completed, total));
+                        }
+                    }
+                    if (request.types().contains(SearchType.TEXT)) {
+                        completed = searchText(current, artifact, leftSide, query, request.canonical(), hit, progress,
+                                completed, total, request.cancellation());
+                    }
+                }
+            } catch (Throwable throwable) {
+                if (!request.cancellation().isCancelled()) failure.accept(unwrap(throwable));
+            }
+        });
+    }
+
+    private int searchText(
+            Workspace current,
+            ArtifactSnapshot artifact,
+            boolean leftSide,
+            String query,
+            boolean canonical,
+            Consumer<SearchHit> hit,
+            Consumer<SearchProgress> progress,
+            int completed,
+            int total,
+            CancellationToken cancellation) throws IOException {
+        for (var resource : artifact.resources().values().stream()
+                .filter(resource -> resource.likelyText() && resource.size() <= 5L * 1024 * 1024)
+                .sorted(java.util.Comparator.comparing(org.earthsworth.wmatcher.core.model.ResourceModel::path)).toList()) {
+            cancellation.throwIfCancelled();
+            ResourceContent content = inspector.resourceContent(artifact, resource.path(), 5 * 1024 * 1024);
+            emitTextHits(leftSide, resource.id(), resource.path(), new String(content.bytes(), StandardCharsets.UTF_8),
+                    query, SearchType.TEXT, hit);
+            progress.accept(new SearchProgress(++completed, total));
+        }
+        Set<String> topLevels = new java.util.TreeSet<>();
+        artifact.classes().keySet().forEach(name -> topLevels.add(name.contains("$")
+                ? name.substring(0, name.indexOf('$')) : name));
+        for (String className : topLevels) {
+            cancellation.throwIfCancelled();
+            try {
+                EntityId classId = EntityId.classId(className);
+                DecompileRequest request = new DecompileRequest(artifact, className,
+                        current.matches().confirmedMappings(), canonical && !leftSide,
+                        leftSide ? current.leftLibraries() : current.rightLibraries());
+                String sourceText = decompiler.decompile(request, cancellation).source();
+                emitTextHits(leftSide, classId, className, sourceText, query, SearchType.TEXT, hit);
+            } catch (IOException ignored) {
+                // A single damaged class should not hide results from the rest of the artifact.
+            }
+            progress.accept(new SearchProgress(++completed, total));
+        }
+        return completed;
+    }
+
+    private static void emitTextHits(
+            boolean leftSide,
+            EntityId id,
+            String path,
+            String value,
+            String query,
+            SearchType type,
+            Consumer<SearchHit> hit) {
+        String[] lines = value.split("\\R", -1);
+        for (int index = 0; index < lines.length; index++) {
+            if (matches(query, lines[index])) {
+                hit.accept(new SearchHit(leftSide, type, id, path, index + 1, lines[index].strip()));
+            }
+        }
+    }
+
+    private static boolean matches(String query, String value) {
+        return value != null && value.toLowerCase(java.util.Locale.ROOT).contains(query);
+    }
+
+    public void exportMappings(
+            Path path,
+            MappingFileFormat format,
+            Runnable success,
+            Consumer<Throwable> failure) {
+        Workspace current = requireWorkspace();
+        executor.submit(() -> {
+            try {
+                mappings.exportMappings(path, format, current.matches());
                 onEdt(success);
             } catch (Throwable throwable) {
                 onEdt(() -> failure.accept(unwrap(throwable)));
@@ -903,6 +1100,14 @@ public final class WorkspaceController implements AutoCloseable {
         if (dropped > 0) {
             warnings.add(dropped + " saved mappings or resolutions could not be validated");
         }
+        long missingLibraries = java.util.stream.Stream.concat(
+                        request.leftLibraries().stream(), request.rightLibraries().stream())
+                .filter(path -> !java.nio.file.Files.isRegularFile(path) && !java.nio.file.Files.isDirectory(path))
+                .distinct()
+                .count();
+        if (missingLibraries > 0) {
+            warnings.add(missingLibraries + " dependency paths are missing");
+        }
         return String.join("; ", warnings);
     }
 
@@ -985,6 +1190,35 @@ public final class WorkspaceController implements AutoCloseable {
 
     private record FilteredOverrides(ComparisonOverrides overrides, int dropped) { }
 
+    public enum SearchSide { OLD, NEW, ALL }
+
+    public enum SearchType { CLASS, MEMBER, FILE, TEXT }
+
+    public record SearchRequest(
+            String query,
+            SearchSide side,
+            Set<SearchType> types,
+            boolean canonical,
+            CancellationToken cancellation) {
+        public SearchRequest {
+            query = query == null ? "" : query;
+            side = side == null ? SearchSide.ALL : side;
+            types = types == null || types.isEmpty() ? Set.of(SearchType.CLASS, SearchType.MEMBER,
+                    SearchType.FILE, SearchType.TEXT) : Set.copyOf(types);
+            cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
+        }
+    }
+
+    public record SearchHit(
+            boolean leftSide,
+            SearchType type,
+            EntityId entity,
+            String path,
+            int line,
+            String preview) { }
+
+    public record SearchProgress(int completed, int total) { }
+
     public record CompareRequest(
             Path leftJar,
             Path rightJar,
@@ -1010,6 +1244,11 @@ public final class WorkspaceController implements AutoCloseable {
             return new CompareRequest(left, right, release, leftLibraries, rightLibraries,
                     ComparisonOverrides.EMPTY, null, "", "",
                     ProjectUiState.empty());
+        }
+
+        public static CompareRequest fresh(
+                Path left, Path right, List<Path> leftLibraries, List<Path> rightLibraries) {
+            return fresh(left, right, 21, leftLibraries, rightLibraries);
         }
     }
 

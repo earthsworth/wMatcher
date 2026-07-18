@@ -30,6 +30,8 @@ import javax.swing.JList;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.KeyStroke;
+import org.earthsworth.wmatcher.app.ShortcutId;
+import org.earthsworth.wmatcher.app.ShortcutManager;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingConstants;
 import javax.swing.UIManager;
@@ -134,11 +136,11 @@ public final class StartPanel extends JPanel {
         };
         recentList.addMouseListener(recentMouseHandler);
         recentList.addMouseMotionListener(recentMouseHandler);
-        recentList.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "open");
+        recentList.getInputMap(JComponent.WHEN_FOCUSED).put(ShortcutManager.stroke(ShortcutId.RECENT_OPEN), "open");
         recentList.getActionMap().put("open", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { openSelected(); }
         });
-        recentList.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "remove");
+        recentList.getInputMap(JComponent.WHEN_FOCUSED).put(ShortcutManager.stroke(ShortcutId.RECENT_REMOVE), "remove");
         recentList.getActionMap().put("remove", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { removeSelected(); }
         });
@@ -152,6 +154,15 @@ public final class StartPanel extends JPanel {
         }
         updateRecentActions();
         return panel;
+    }
+
+    public void refreshShortcuts() {
+        recentList.getInputMap(JComponent.WHEN_FOCUSED).remove(ShortcutId.RECENT_OPEN.defaultStroke());
+        recentList.getInputMap(JComponent.WHEN_FOCUSED).remove(ShortcutId.RECENT_REMOVE.defaultStroke());
+        recentList.getInputMap(JComponent.WHEN_FOCUSED)
+                .put(ShortcutManager.stroke(ShortcutId.RECENT_OPEN), "open");
+        recentList.getInputMap(JComponent.WHEN_FOCUSED)
+                .put(ShortcutManager.stroke(ShortcutId.RECENT_REMOVE), "remove");
     }
 
     private void openSelected() {

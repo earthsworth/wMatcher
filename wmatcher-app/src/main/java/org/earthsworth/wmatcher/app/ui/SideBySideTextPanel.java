@@ -26,6 +26,8 @@ import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
 import javax.swing.KeyStroke;
+import org.earthsworth.wmatcher.app.ShortcutId;
+import org.earthsworth.wmatcher.app.ShortcutManager;
 import javax.swing.SwingUtilities;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
@@ -63,6 +65,8 @@ public final class SideBySideTextPanel extends JPanel {
     private TextDiff.LineChanges lineChanges = new TextDiff.LineChanges(Set.of(), Set.of());
     private TextRange leftNavigationRange;
     private TextRange rightNavigationRange;
+    private int pendingLeftLine;
+    private int pendingRightLine;
 
     public SideBySideTextPanel() {
         super(new BorderLayout());
@@ -105,6 +109,13 @@ public final class SideBySideTextPanel extends JPanel {
         rightMinimap.setContent(right.getText(), lineChanges.rightMarkers());
         refreshFindHighlights();
         revealNavigationRanges();
+        revealPendingLines();
+    }
+
+    public void revealLine(boolean leftSide, int line) {
+        if (line < 1) return;
+        if (leftSide) pendingLeftLine = line; else pendingRightLine = line;
+        revealPendingLines();
     }
 
     public void setMinimapVisible(boolean visible) {
@@ -112,6 +123,12 @@ public final class SideBySideTextPanel extends JPanel {
         rightMinimap.setVisible(visible);
         revalidate();
         repaint();
+    }
+
+    public void refreshShortcuts() {
+        installFindFieldActions();
+        bindEditorShortcuts(left);
+        bindEditorShortcuts(right);
     }
 
     @Override
@@ -205,12 +222,13 @@ public final class SideBySideTextPanel extends JPanel {
     }
 
     private void installFindFieldActions() {
-        findField.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "find-next");
+        findField.getInputMap().remove(ShortcutId.FIND_FIELD_NEXT.defaultStroke());
+        findField.getInputMap().remove(ShortcutId.FIND_FIELD_PREVIOUS.defaultStroke());
+        findField.getInputMap().put(ShortcutManager.stroke(ShortcutId.FIND_FIELD_NEXT), "find-next");
         findField.getActionMap().put("find-next", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { find(true); }
         });
-        findField.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK),
-                "find-previous");
+        findField.getInputMap().put(ShortcutManager.stroke(ShortcutId.FIND_FIELD_PREVIOUS), "find-previous");
         findField.getActionMap().put("find-previous", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { find(false); }
         });
@@ -229,15 +247,22 @@ public final class SideBySideTextPanel extends JPanel {
                 if (findBar.isVisible()) refreshFindHighlights();
             }
         });
-        area.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK), "open-find");
+        bindEditorShortcuts(area);
+    }
+
+    private void bindEditorShortcuts(RSyntaxTextArea area) {
+        area.getInputMap().remove(ShortcutId.FIND.defaultStroke());
+        area.getInputMap().remove(ShortcutId.FIND_NEXT.defaultStroke());
+        area.getInputMap().remove(ShortcutId.FIND_PREVIOUS.defaultStroke());
+        area.getInputMap().put(ShortcutManager.stroke(ShortcutId.FIND), "open-find");
         area.getActionMap().put("open-find", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { openFind(area); }
         });
-        area.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_F3, 0), "find-next");
+        area.getInputMap().put(ShortcutManager.stroke(ShortcutId.FIND_NEXT), "find-next");
         area.getActionMap().put("find-next", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { find(true); }
         });
-        area.getInputMap().put(KeyStroke.getKeyStroke(KeyEvent.VK_F3, InputEvent.SHIFT_DOWN_MASK), "find-previous");
+        area.getInputMap().put(ShortcutManager.stroke(ShortcutId.FIND_PREVIOUS), "find-previous");
         area.getActionMap().put("find-previous", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { find(false); }
         });
@@ -432,6 +457,34 @@ public final class SideBySideTextPanel extends JPanel {
             }
         } catch (BadLocationException ignored) {
             // The selected entity may disappear if a newer async document replaces this text.
+        }
+    }
+
+    private void revealPendingLines() {
+        if (pendingLeftLine > 0) {
+            revealLine(left, leftScroll, pendingLeftLine);
+            pendingLeftLine = 0;
+        }
+        if (pendingRightLine > 0) {
+            revealLine(right, rightScroll, pendingRightLine);
+            pendingRightLine = 0;
+        }
+    }
+
+    private static void revealLine(RSyntaxTextArea area, JScrollPane scrollPane, int line) {
+        try {
+            int target = Math.max(0, Math.min(area.getLineCount() - 1, line - 1));
+            int offset = area.getLineStartOffset(target);
+            area.setCaretPosition(offset);
+            Rectangle2D rectangle = area.modelToView2D(offset);
+            if (rectangle != null) {
+                int y = Math.max(0, (int) rectangle.getY()
+                        - scrollPane.getViewport().getExtentSize().height / 2);
+                Point current = scrollPane.getViewport().getViewPosition();
+                scrollPane.getViewport().setViewPosition(new Point(current.x, y));
+            }
+        } catch (BadLocationException ignored) {
+            // Content may still be replaced by an asynchronous load.
         }
     }
 

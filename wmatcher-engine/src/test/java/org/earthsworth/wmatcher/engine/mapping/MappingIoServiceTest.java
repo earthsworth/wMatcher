@@ -7,6 +7,8 @@ import java.nio.file.Path;
 import java.util.Map;
 import org.earthsworth.wmatcher.core.model.EntityId;
 import org.earthsworth.wmatcher.core.model.MappingOverrides;
+import org.earthsworth.wmatcher.core.model.MappingImportResult;
+import org.earthsworth.wmatcher.core.model.MappingFileFormat;
 import org.earthsworth.wmatcher.core.model.MatchingPolicy;
 import org.earthsworth.wmatcher.core.model.ScanOptions;
 import org.earthsworth.wmatcher.core.task.CancellationToken;
@@ -66,5 +68,54 @@ class MappingIoServiceTest {
             assertThat(oldId.name()).isEqualTo("calculate");
             assertThat(newId.name()).isEqualTo("x");
         });
+    }
+
+    @Test
+    void importsDirectProguardMapping() throws Exception {
+        Path leftJar = TestArtifacts.writeJar(temporaryDirectory.resolve("direct-left.jar"),
+                Map.of("old/Readable.class", TestArtifacts.simpleClass("old/Readable", "calculate", 3, 1)), false);
+        Path rightJar = TestArtifacts.writeJar(temporaryDirectory.resolve("direct-right.jar"),
+                Map.of("a/b.class", TestArtifacts.simpleClass("a/b", "x", 3, 1)), false);
+        Path mapping = temporaryDirectory.resolve("direct.txt");
+        Files.writeString(mapping, "old.Readable -> a.b:\n    int calculate() -> x\n");
+        JarArtifactLoader loader = new JarArtifactLoader();
+        var left = loader.load(leftJar, ScanOptions.productionDefaults(), ProgressListener.NONE, CancellationToken.NONE);
+        var right = loader.load(rightJar, ScanOptions.productionDefaults(), ProgressListener.NONE, CancellationToken.NONE);
+
+        MappingImportResult imported = new MappingIoService().importMappings(
+                MappingFileFormat.PROGUARD, mapping, null, left, right);
+
+        assertThat(imported.mappings()).containsEntry(EntityId.classId("old/Readable"), EntityId.classId("a/b"));
+        assertThat(imported.mappings()).containsEntry(
+                EntityId.methodId("old/Readable", "calculate", "()I"),
+                EntityId.methodId("a/b", "x", "()I"));
+    }
+
+    @Test
+    void exportsAllSupportedMappingFormats() throws Exception {
+        Path leftJar = TestArtifacts.writeJar(temporaryDirectory.resolve("formats-left.jar"),
+                Map.of("old/A.class", TestArtifacts.simpleClass("old/A", "read", 3, 1)), false);
+        Path rightJar = TestArtifacts.writeJar(temporaryDirectory.resolve("formats-right.jar"),
+                Map.of("old/B.class", TestArtifacts.simpleClass("old/B", "a", 3, 1)), false);
+        JarArtifactLoader loader = new JarArtifactLoader();
+        var left = loader.load(leftJar, ScanOptions.productionDefaults(), ProgressListener.NONE, CancellationToken.NONE);
+        var right = loader.load(rightJar, ScanOptions.productionDefaults(), ProgressListener.NONE, CancellationToken.NONE);
+        var matches = new DefaultMatchingEngine().match(left, right, MappingOverrides.EMPTY,
+                MatchingPolicy.conservativeV1(), ProgressListener.NONE, CancellationToken.NONE);
+        MappingIoService service = new MappingIoService();
+        for (MappingFileFormat format : MappingFileFormat.values()) {
+            Path destination = format == MappingFileFormat.ENIGMA
+                    ? Files.createDirectories(temporaryDirectory.resolve("out-" + format.name()))
+                    : temporaryDirectory.resolve("out-" + format.name() + ".map");
+            service.exportMappings(destination, format, matches);
+            if (format != MappingFileFormat.ENIGMA) {
+                assertThat(Files.size(destination)).isGreaterThan(0);
+                assertThat(service.importMappings(format, destination, null, left, right).mappings())
+                        .as(format.name())
+                        .containsEntry(EntityId.classId("old/A"), EntityId.classId("old/B"));
+            } else {
+                assertThat(Files.exists(destination)).isTrue();
+            }
+        }
     }
 }

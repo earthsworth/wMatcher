@@ -16,7 +16,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.function.Consumer;
 import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
@@ -27,19 +26,18 @@ import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JRootPane;
-import javax.swing.JSpinner;
 import javax.swing.JTextField;
 import javax.swing.JToggleButton;
 import javax.swing.KeyStroke;
-import javax.swing.SpinnerNumberModel;
 import javax.swing.TransferHandler;
-import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.filechooser.FileFilter;
 import org.earthsworth.wmatcher.app.WorkspaceController;
+import org.earthsworth.wmatcher.app.ShortcutId;
+import org.earthsworth.wmatcher.app.ShortcutManager;
 
 public final class NewProjectDialog extends JDialog {
     private final JTextField leftPath = new JTextField();
     private final JTextField rightPath = new JTextField();
-    private final JSpinner targetRelease = new JSpinner(new SpinnerNumberModel(21, 8, 99, 1));
     private final List<Path> leftLibraries = new ArrayList<>();
     private final List<Path> rightLibraries = new ArrayList<>();
     private final JLabel leftLibraryCount = new JLabel(text("start.libraryCount", 0));
@@ -80,11 +78,7 @@ public final class NewProjectDialog extends JDialog {
             showAdvanced.setText(text(showAdvanced.isSelected() ? "start.hideAdvanced" : "start.advanced"));
             pack();
         });
-        JPanel release = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
-        release.add(new JLabel(text("start.target")));
-        release.add(targetRelease);
         options.add(showAdvanced, BorderLayout.WEST);
-        options.add(release, BorderLayout.EAST);
         panel.add(options, BorderLayout.SOUTH);
         return panel;
     }
@@ -108,13 +102,13 @@ public final class NewProjectDialog extends JDialog {
         constraints.weightx = 0;
         constraints.fill = GridBagConstraints.NONE;
         panel.add(new JLabel(label), constraints);
-        field.setTransferHandler(new JarDropHandler(field));
+        field.setTransferHandler(new PathDropHandler(paths -> field.setText(paths.getFirst().toString()), false));
         constraints.gridx = 1;
         constraints.weightx = 1;
         constraints.fill = GridBagConstraints.HORIZONTAL;
         panel.add(field, constraints);
         JButton browse = new JButton(text("start.browse"));
-        browse.addActionListener(event -> chooseJar(field));
+        browse.addActionListener(event -> chooseArtifact(field));
         constraints.gridx = 2;
         constraints.weightx = 0;
         constraints.fill = GridBagConstraints.NONE;
@@ -134,36 +128,51 @@ public final class NewProjectDialog extends JDialog {
         panel.add(new JLabel(label), constraints);
         JButton choose = new JButton(text("start.libraries"));
         choose.addActionListener(event -> chooseLibraries(libraries, count));
+        PathDropHandler dropHandler = new PathDropHandler(paths -> {
+            libraries.clear();
+            libraries.addAll(paths);
+            count.setText(text("start.libraryCount", libraries.size()));
+        }, true);
+        choose.setTransferHandler(dropHandler);
+        count.setTransferHandler(dropHandler);
         constraints.gridx = 1;
         panel.add(choose, constraints);
         constraints.gridx = 2;
         constraints.weightx = 1;
         constraints.anchor = GridBagConstraints.WEST;
         panel.add(count, constraints);
+        JButton clear = new JButton("\u00d7");
+        clear.setToolTipText(text("start.clearLibraries"));
+        clear.addActionListener(event -> {
+            libraries.clear();
+            count.setText(text("start.libraryCount", 0));
+        });
+        constraints.gridx = 3;
+        constraints.weightx = 0;
+        panel.add(clear, constraints);
     }
 
     private void submit(Consumer<WorkspaceController.CompareRequest> compare) {
         Path left = path(leftPath);
         Path right = path(rightPath);
-        if (left == null || right == null || !Files.isRegularFile(left) || !Files.isRegularFile(right)) {
+        if (!validArtifact(left) || !validArtifact(right)) {
             JOptionPane.showMessageDialog(this, text("dialog.invalidInput"), text("dialog.error"),
                     JOptionPane.WARNING_MESSAGE);
             return;
         }
         dispose();
-        compare.accept(WorkspaceController.CompareRequest.fresh(
-                left, right, (Integer) targetRelease.getValue(), leftLibraries, rightLibraries));
+        compare.accept(WorkspaceController.CompareRequest.fresh(left, right, leftLibraries, rightLibraries));
     }
 
-    private void chooseJar(JTextField target) {
-        JFileChooser chooser = jarChooser(text("dialog.chooseJar"), false);
+    private void chooseArtifact(JTextField target) {
+        JFileChooser chooser = artifactChooser(text("dialog.chooseArtifact"), false);
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             target.setText(chooser.getSelectedFile().toPath().toAbsolutePath().normalize().toString());
         }
     }
 
     private void chooseLibraries(List<Path> target, JLabel count) {
-        JFileChooser chooser = jarChooser(text("dialog.chooseLibraries"), true);
+        JFileChooser chooser = artifactChooser(text("dialog.chooseLibraries"), true);
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
             target.clear();
             for (File file : chooser.getSelectedFiles()) {
@@ -175,7 +184,7 @@ public final class NewProjectDialog extends JDialog {
 
     private void installEscapeAction() {
         JRootPane root = getRootPane();
-        root.getInputMap(JRootPane.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("ESCAPE"), "close");
+        root.getInputMap(JRootPane.WHEN_IN_FOCUSED_WINDOW).put(ShortcutManager.stroke(ShortcutId.CLOSE_CHILD), "close");
         root.getActionMap().put("close", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { dispose(); }
         });
@@ -189,48 +198,95 @@ public final class NewProjectDialog extends JDialog {
         return constraints;
     }
 
-    private static JFileChooser jarChooser(String title, boolean multiple) {
+    private static JFileChooser artifactChooser(String title, boolean multiple) {
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle(title);
         chooser.setMultiSelectionEnabled(multiple);
-        chooser.setFileFilter(new FileNameExtensionFilter("Java archives (*.jar)", "jar"));
+        chooser.setFileSelectionMode(JFileChooser.FILES_AND_DIRECTORIES);
+        chooser.setFileFilter(new FileFilter() {
+            @Override
+            public boolean accept(File file) {
+                if (file.isDirectory()) return true;
+                String name = file.getName().toLowerCase(java.util.Locale.ROOT);
+                return name.endsWith(".jar") || name.endsWith(".zip");
+            }
+
+            @Override
+            public String getDescription() {
+                return text("dialog.artifactFilter");
+            }
+        });
         return chooser;
     }
 
     private static Path path(JTextField field) {
         try {
-            return field.getText().isBlank() ? null : Path.of(field.getText()).toAbsolutePath().normalize();
+            String value = normalizedPathText(field.getText());
+            return value.isBlank() ? null : Path.of(value).toAbsolutePath().normalize();
         } catch (RuntimeException ignored) {
             return null;
         }
     }
 
-    private static final class JarDropHandler extends TransferHandler {
-        private final JTextField target;
+    private static boolean validArtifact(Path path) {
+        return path != null && (Files.isRegularFile(path) || Files.isDirectory(path));
+    }
 
-        JarDropHandler(JTextField target) {
-            this.target = target;
+    private static String normalizedPathText(String value) {
+        String normalized = value == null ? "" : value.strip();
+        if (normalized.length() >= 2 && normalized.startsWith("\"") && normalized.endsWith("\"")) {
+            normalized = normalized.substring(1, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
+    private static final class PathDropHandler extends TransferHandler {
+        private final Consumer<List<Path>> consumer;
+        private final boolean multiple;
+
+        PathDropHandler(Consumer<List<Path>> consumer, boolean multiple) {
+            this.consumer = consumer;
+            this.multiple = multiple;
         }
 
         @Override
         public boolean canImport(TransferSupport support) {
-            return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor);
+            return support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)
+                    || support.isDataFlavorSupported(DataFlavor.stringFlavor);
         }
 
         @Override
         public boolean importData(TransferSupport support) {
             if (!canImport(support)) return false;
             try {
-                Object value = support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
-                if (value instanceof List<?> files && !files.isEmpty() && files.getFirst() instanceof File file
-                        && file.getName().toLowerCase(Locale.ROOT).endsWith(".jar")) {
-                    target.setText(file.toPath().toAbsolutePath().normalize().toString());
-                    return true;
+                List<Path> paths = new ArrayList<>();
+                if (support.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
+                    Object value = support.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
+                    if (value instanceof List<?> files) {
+                        for (Object candidate : files) {
+                            if (candidate instanceof File file) {
+                                paths.add(file.toPath().toAbsolutePath().normalize());
+                                if (!multiple) break;
+                            }
+                        }
+                    }
+                } else {
+                    String value = String.valueOf(support.getTransferable().getTransferData(DataFlavor.stringFlavor));
+                    for (String line : value.split("\\R")) {
+                        String normalized = normalizedPathText(line);
+                        if (!normalized.isBlank()) {
+                            paths.add(Path.of(normalized).toAbsolutePath().normalize());
+                            if (!multiple) break;
+                        }
+                    }
                 }
+                paths.removeIf(path -> !validArtifact(path));
+                if (paths.isEmpty()) return false;
+                consumer.accept(List.copyOf(paths));
+                return true;
             } catch (Exception ignored) {
                 return false;
             }
-            return false;
         }
     }
 }
