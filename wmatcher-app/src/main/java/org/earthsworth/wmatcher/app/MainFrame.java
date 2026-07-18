@@ -433,7 +433,7 @@ public final class MainFrame extends JFrame {
     private void showGlobalSearch() {
         if (controller.workspace() == null || workspacePanel == null) return;
         new GlobalSearchDialog(this, controller, workspacePanel::navigateToSearchHit,
-                workspacePanel::canonicalNamesEnabled).setVisible(true);
+                workspacePanel::canonicalNamesDirection).setVisible(true);
     }
 
     private void bindGlobal(

@@ -264,11 +264,20 @@ class WorkspaceControllerTest {
 
         String bytecode = awaitText((success, failure) ->
                 controller.loadBytecode(method, true, true, success, failure));
-        String source = awaitText((success, failure) ->
-                controller.loadSource(method, true, true, success, failure));
+        String leftSource = awaitText((success, failure) -> controller.loadSource(method, true,
+                WorkspaceController.CanonicalNamesDirection.DISABLED, success, failure));
+        String rightSource = awaitText((success, failure) -> controller.loadSource(method, false,
+                WorkspaceController.CanonicalNamesDirection.DISABLED, success, failure));
+        String leftUsingRightNames = awaitText((success, failure) -> controller.loadSource(method, true,
+                WorkspaceController.CanonicalNamesDirection.LEFT_TO_RIGHT, success, failure));
+        String rightUsingLeftNames = awaitText((success, failure) -> controller.loadSource(method, false,
+                WorkspaceController.CanonicalNamesDirection.RIGHT_TO_LEFT, success, failure));
 
         assertThat(bytecode).contains("read()I");
-        assertThat(source).contains("read(");
+        assertThat(leftSource).contains("read(");
+        assertThat(rightSource).contains("x(");
+        assertThat(leftUsingRightNames).contains("x(");
+        assertThat(rightUsingLeftNames).contains("read(");
         controller.close();
     }
 

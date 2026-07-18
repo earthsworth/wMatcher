@@ -36,12 +36,13 @@ import javax.swing.table.AbstractTableModel;
 import org.earthsworth.wmatcher.app.ShortcutId;
 import org.earthsworth.wmatcher.app.ShortcutManager;
 import org.earthsworth.wmatcher.app.WorkspaceController;
+import org.earthsworth.wmatcher.app.WorkspaceController.CanonicalNamesDirection;
 
 public final class GlobalSearchDialog extends JDialog {
     private static final int MAXIMUM_RESULTS = 1_000;
     private final WorkspaceController controller;
     private final Consumer<WorkspaceController.SearchHit> navigator;
-    private final Supplier<Boolean> canonical;
+    private final Supplier<CanonicalNamesDirection> canonicalNames;
     private final JTextField query = new JTextField();
     private final SearchMatcherSelect matcher = new SearchMatcherSelect(ignored -> schedule());
     private final JComboBox<SideChoice> side = new JComboBox<>();
@@ -62,11 +63,11 @@ public final class GlobalSearchDialog extends JDialog {
             Window owner,
             WorkspaceController controller,
             Consumer<WorkspaceController.SearchHit> navigator,
-            Supplier<Boolean> canonical) {
+            Supplier<CanonicalNamesDirection> canonicalNames) {
         super(owner, text("dialog.globalSearch"), Dialog.ModalityType.MODELESS);
         this.controller = controller;
         this.navigator = navigator;
-        this.canonical = canonical;
+        this.canonicalNames = canonicalNames;
         debounce.setRepeats(false);
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
         setLayout(new BorderLayout(0, 8));
@@ -167,7 +168,7 @@ public final class GlobalSearchDialog extends JDialog {
         status.setText(text("search.searching"));
         var request = new WorkspaceController.SearchRequest(value, matcher.matcher(),
                 selectedSide == null ? WorkspaceController.SearchSide.ALL : selectedSide.side(),
-                types, canonical.get(), cancellation::get);
+                types, canonicalNames.get(), cancellation::get);
         job = controller.search(request,
                 hit -> SwingUtilities.invokeLater(() -> addHit(currentGeneration, hit)),
                 update -> SwingUtilities.invokeLater(() -> updateProgress(currentGeneration, update)),

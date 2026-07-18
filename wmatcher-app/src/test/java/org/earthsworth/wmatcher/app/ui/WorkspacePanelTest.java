@@ -43,6 +43,10 @@ class WorkspacePanelTest {
         assertThat(result.panel).isNotNull();
         assertThat(result.panel.getComponentCount()).isGreaterThan(0);
         assertThat(result.panel.summaryCardCountForTesting()).isEqualTo(5);
+        assertThat(result.panel.canonicalNameOptionsForTesting()).containsExactly(
+                "LEFT -> RIGHT", "RIGHT -> LEFT", "Disabled");
+        assertThat(result.panel.canonicalNamesDirection())
+                .isEqualTo(WorkspaceController.CanonicalNamesDirection.RIGHT_TO_LEFT);
         controller.close();
     }
 

@@ -588,7 +588,7 @@ public final class WorkspaceController implements AutoCloseable {
                         }
                     }
                     if (request.types().contains(SearchType.TEXT)) {
-                        completed = searchText(current, artifact, leftSide, matcher, request.canonical(), hit, progress,
+                        completed = searchText(current, artifact, leftSide, matcher, request.canonicalNames(), hit, progress,
                                 completed, total, request.cancellation());
                     }
                 }
@@ -603,7 +603,7 @@ public final class WorkspaceController implements AutoCloseable {
             ArtifactSnapshot artifact,
             boolean leftSide,
             java.util.function.Predicate<String> matcher,
-            boolean canonical,
+            CanonicalNamesDirection canonicalNames,
             Consumer<SearchHit> hit,
             Consumer<SearchProgress> progress,
             int completed,
@@ -625,8 +625,9 @@ public final class WorkspaceController implements AutoCloseable {
             cancellation.throwIfCancelled();
             try {
                 EntityId classId = EntityId.classId(className);
+                boolean remap = canonicalNames.remaps(leftSide);
                 DecompileRequest request = new DecompileRequest(artifact, className,
-                        current.matches().confirmedMappings(), canonical && !leftSide,
+                        canonicalMappings(current, leftSide, remap), remap,
                         leftSide ? current.leftLibraries() : current.rightLibraries());
                 String sourceText = decompiler.decompile(request, cancellation).source();
                 emitTextHits(leftSide, classId, className, sourceText, matcher, SearchType.TEXT, hit);
@@ -696,7 +697,11 @@ public final class WorkspaceController implements AutoCloseable {
     }
 
     public void loadSource(
-            DiffNode node, boolean leftSide, boolean canonical, Consumer<String> success, Consumer<Throwable> failure) {
+            DiffNode node,
+            boolean leftSide,
+            CanonicalNamesDirection canonicalNames,
+            Consumer<String> success,
+            Consumer<Throwable> failure) {
         Workspace current = requireWorkspace();
         EntityId id = leftSide ? node.left() : node.right();
         if (id == null || id.kind() == EntityKind.RESOURCE) {
@@ -706,14 +711,33 @@ public final class WorkspaceController implements AutoCloseable {
         ArtifactSnapshot artifact = leftSide ? current.left() : current.right();
         List<Path> libraries = new ArrayList<>(leftSide ? current.leftLibraries() : current.rightLibraries());
         libraries.add(leftSide ? current.right().path() : current.left().path());
+        boolean remap = canonicalNames.remaps(leftSide);
         DecompileRequest request = new DecompileRequest(
                 artifact,
                 id.kind() == EntityKind.CLASS ? id.name() : id.owner(),
-                current.matches().confirmedMappings(),
-                canonical && !leftSide,
+                canonicalMappings(current, leftSide, remap),
+                remap,
                 libraries);
         AtomicBoolean requestCancellation = cancellation;
         async(() -> decompiler.decompile(request, requestCancellation::get).source(), success, failure);
+    }
+
+    public void loadSource(
+            DiffNode node, boolean leftSide, boolean canonical, Consumer<String> success, Consumer<Throwable> failure) {
+        loadSource(node, leftSide,
+                canonical ? CanonicalNamesDirection.RIGHT_TO_LEFT : CanonicalNamesDirection.DISABLED,
+                success, failure);
+    }
+
+    private static Map<EntityId, EntityId> canonicalMappings(
+            Workspace workspace, boolean leftSide, boolean remap) {
+        Map<EntityId, EntityId> mappings = workspace.matches().confirmedMappings();
+        if (!remap || !leftSide) {
+            return mappings;
+        }
+        Map<EntityId, EntityId> reversed = new LinkedHashMap<>();
+        mappings.forEach((left, right) -> reversed.put(right, left));
+        return reversed;
     }
 
     public void cancel() {
@@ -1191,12 +1215,26 @@ public final class WorkspaceController implements AutoCloseable {
 
     public enum SearchType { CLASS, MEMBER, FILE, TEXT }
 
+    public enum CanonicalNamesDirection {
+        LEFT_TO_RIGHT,
+        RIGHT_TO_LEFT,
+        DISABLED;
+
+        public boolean remaps(boolean leftSide) {
+            return switch (this) {
+                case LEFT_TO_RIGHT -> leftSide;
+                case RIGHT_TO_LEFT -> !leftSide;
+                case DISABLED -> false;
+            };
+        }
+    }
+
     public record SearchRequest(
             String query,
             SearchMatcher matcher,
             SearchSide side,
             Set<SearchType> types,
-            boolean canonical,
+            CanonicalNamesDirection canonicalNames,
             CancellationToken cancellation) {
         public SearchRequest {
             query = query == null ? "" : query;
@@ -1204,7 +1242,20 @@ public final class WorkspaceController implements AutoCloseable {
             side = side == null ? SearchSide.ALL : side;
             types = types == null || types.isEmpty() ? Set.of(SearchType.CLASS, SearchType.MEMBER,
                     SearchType.FILE, SearchType.TEXT) : Set.copyOf(types);
+            canonicalNames = canonicalNames == null ? CanonicalNamesDirection.DISABLED : canonicalNames;
             cancellation = cancellation == null ? CancellationToken.NONE : cancellation;
+        }
+
+        public SearchRequest(
+                String query,
+                SearchMatcher matcher,
+                SearchSide side,
+                Set<SearchType> types,
+                boolean canonical,
+                CancellationToken cancellation) {
+            this(query, matcher, side, types,
+                    canonical ? CanonicalNamesDirection.RIGHT_TO_LEFT : CanonicalNamesDirection.DISABLED,
+                    cancellation);
         }
 
         public SearchRequest(
@@ -1213,7 +1264,9 @@ public final class WorkspaceController implements AutoCloseable {
                 Set<SearchType> types,
                 boolean canonical,
                 CancellationToken cancellation) {
-            this(query, SearchMatcher.CONTAINS_IGNORE_CASE, side, types, canonical, cancellation);
+            this(query, SearchMatcher.CONTAINS_IGNORE_CASE, side, types,
+                    canonical ? CanonicalNamesDirection.RIGHT_TO_LEFT : CanonicalNamesDirection.DISABLED,
+                    cancellation);
         }
     }
 

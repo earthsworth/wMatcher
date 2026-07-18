@@ -61,6 +61,7 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import org.earthsworth.wmatcher.app.SearchMatcher;
 import org.earthsworth.wmatcher.app.WorkspaceController;
+import org.earthsworth.wmatcher.app.WorkspaceController.CanonicalNamesDirection;
 import org.earthsworth.wmatcher.core.model.ChangeKind;
 import org.earthsworth.wmatcher.core.model.ClassClassification;
 import org.earthsworth.wmatcher.core.model.ClassPair;
@@ -105,7 +106,7 @@ public final class WorkspacePanel extends JPanel {
     private final SideBySideTextPanel bytecode = new SideBySideTextPanel();
     private final SideBySideTextPanel source = new SideBySideTextPanel();
     private final JCheckBox semantic = new JCheckBox(text("detail.semantic"), true);
-    private final JCheckBox canonical = new JCheckBox(text("detail.canonical"), true);
+    private final JComboBox<CanonicalNameOption> canonicalNames = new JComboBox<>();
     private final JTabbedPane tabs = new JTabbedPane();
     private final JSplitPane workspaceSplit = new JSplitPane();
     private final Set<String> expandedTreeKeys = new LinkedHashSet<>();
@@ -192,8 +193,9 @@ public final class WorkspacePanel extends JPanel {
         tree.requestFocusInWindow();
     }
 
-    public boolean canonicalNamesEnabled() {
-        return canonical.isSelected();
+    public CanonicalNamesDirection canonicalNamesDirection() {
+        CanonicalNameOption selected = (CanonicalNameOption) canonicalNames.getSelectedItem();
+        return selected == null ? CanonicalNamesDirection.DISABLED : selected.direction();
     }
 
     public void selectDetailTab(int index) {
@@ -286,13 +288,21 @@ public final class WorkspacePanel extends JPanel {
 
         JPanel sourcePanel = new JPanel(new BorderLayout());
         JPanel sourceOptions = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        sourceOptions.add(canonical);
+        canonicalNames.addItem(new CanonicalNameOption(
+                text("detail.canonical.leftToRight"), CanonicalNamesDirection.LEFT_TO_RIGHT));
+        canonicalNames.addItem(new CanonicalNameOption(
+                text("detail.canonical.rightToLeft"), CanonicalNamesDirection.RIGHT_TO_LEFT));
+        canonicalNames.addItem(new CanonicalNameOption(
+                text("detail.canonical.disabled"), CanonicalNamesDirection.DISABLED));
+        canonicalNames.setSelectedIndex(1);
+        sourceOptions.add(new JLabel(text("detail.canonical")));
+        sourceOptions.add(canonicalNames);
         sourcePanel.add(sourceOptions, BorderLayout.NORTH);
         sourcePanel.add(source, BorderLayout.CENTER);
         tabs.addTab(text("tab.source"), sourcePanel);
 
         semantic.addActionListener(event -> loadBytecode());
-        canonical.addActionListener(event -> {
+        canonicalNames.addActionListener(event -> {
             sourceGeneration = -1;
             loadSource();
         });
@@ -712,9 +722,10 @@ public final class WorkspacePanel extends JPanel {
         sourceGeneration = generation;
         long requestGeneration = generation;
         source.setLoading(text("detail.loading"));
+        CanonicalNamesDirection direction = canonicalNamesDirection();
         loadPair(
-                callback -> controller.loadSource(node, true, canonical.isSelected(), callback, errorHandler),
-                callback -> controller.loadSource(node, false, canonical.isSelected(), callback, errorHandler),
+                callback -> controller.loadSource(node, true, direction, callback, errorHandler),
+                callback -> controller.loadSource(node, false, direction, callback, errorHandler),
                 source,
                 requestGeneration,
                 sourceLocator(node, true),
@@ -723,8 +734,8 @@ public final class WorkspacePanel extends JPanel {
 
     private TextLocator sourceLocator(DiffNode node, boolean leftSide) {
         EntityId id = leftSide ? node.left() : node.right();
-        if (!leftSide && canonical.isSelected() && node.left() != null && node.right() != null) {
-            id = node.left();
+        if (canonicalNamesDirection().remaps(leftSide) && node.left() != null && node.right() != null) {
+            id = leftSide ? node.right() : node.left();
         }
         return MemberTextLocator.source(id);
     }
@@ -1599,6 +1610,14 @@ public final class WorkspacePanel extends JPanel {
         return summary.values();
     }
 
+    List<String> canonicalNameOptionsForTesting() {
+        List<String> options = new ArrayList<>();
+        for (int index = 0; index < canonicalNames.getItemCount(); index++) {
+            options.add(canonicalNames.getItemAt(index).toString());
+        }
+        return options;
+    }
+
     EntityId mappingSubjectForTesting(DiffNode node) {
         DiffNode subject = mappingNode(node);
         return subject == null ? null : subject.left() != null ? subject.left() : subject.right();
@@ -1685,6 +1704,10 @@ public final class WorkspacePanel extends JPanel {
     private enum FilterKind { ALL, CHANGED, ADDED, REMOVED, MODIFIED, UNRESOLVED }
 
     private record FilterOption(String label, FilterKind kind) {
+        @Override public String toString() { return label; }
+    }
+
+    private record CanonicalNameOption(String label, CanonicalNamesDirection direction) {
         @Override public String toString() { return label; }
     }
 
