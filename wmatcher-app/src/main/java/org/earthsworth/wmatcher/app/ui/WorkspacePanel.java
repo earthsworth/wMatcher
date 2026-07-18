@@ -294,7 +294,7 @@ public final class WorkspacePanel extends JPanel {
                 text("detail.canonical.rightToLeft"), CanonicalNamesDirection.RIGHT_TO_LEFT));
         canonicalNames.addItem(new CanonicalNameOption(
                 text("detail.canonical.disabled"), CanonicalNamesDirection.DISABLED));
-        canonicalNames.setSelectedIndex(1);
+        canonicalNames.setSelectedIndex(2);
         sourceOptions.add(new JLabel(text("detail.canonical")));
         sourceOptions.add(canonicalNames);
         sourcePanel.add(sourceOptions, BorderLayout.NORTH);

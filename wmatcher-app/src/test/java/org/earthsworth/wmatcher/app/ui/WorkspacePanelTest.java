@@ -46,7 +46,7 @@ class WorkspacePanelTest {
         assertThat(result.panel.canonicalNameOptionsForTesting()).containsExactly(
                 "LEFT -> RIGHT", "RIGHT -> LEFT", "Disabled");
         assertThat(result.panel.canonicalNamesDirection())
-                .isEqualTo(WorkspaceController.CanonicalNamesDirection.RIGHT_TO_LEFT);
+                .isEqualTo(WorkspaceController.CanonicalNamesDirection.DISABLED);
         controller.close();
     }
 
